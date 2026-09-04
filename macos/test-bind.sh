@@ -44,8 +44,9 @@ timeout_ms = 5000
 refresh_interval_ms = 300000
 TOML
 
-HOME="$test_home" CODEX_HOME="$test_home/.codex" bash "$script_dir/codex-app-bind" gateway >/dev/null
 config="$test_home/.codex/config.toml"
+
+HOME="$test_home" CODEX_HOME="$test_home/.codex" bash "$script_dir/codex-app-bind" gateway >/dev/null
 grep -Fq 'model = "gpt-5.4"' "$config"
 grep -Fq 'model_provider = "personal_gateway"' "$config"
 grep -Fq '# UTF-8 回归：中文必须完整保留' "$config"
@@ -57,10 +58,18 @@ if grep -Fq 'https://old.invalid/v1' "$config"; then
   exit 1
 fi
 
+HOME="$test_home" CODEX_HOME="$test_home/.codex" bash "$script_dir/codex-app-bind" teamo >/dev/null
+grep -Fq 'model = "teamo/gpt-5.6-sol"' "$config"
+grep -Fq 'model_provider = "personal_gateway"' "$config"
+grep -Fq '# UTF-8 回归：中文必须完整保留' "$config"
+grep -Fq 'args = ["你好，Mac"]' "$config"
+[[ "$(grep -Fc '[model_providers.personal_gateway]' "$config")" -eq 1 ]]
+[[ "$(grep -Fc '[model_providers.personal_gateway.auth]' "$config")" -eq 1 ]]
+
 HOME="$test_home" CODEX_HOME="$test_home/.codex" bash "$script_dir/codex-app-bind" official >/dev/null
 grep -Fq 'model = "gpt-5.6-sol"' "$config"
 grep -Fq 'model_provider = "openai"' "$config"
 grep -Fq '# UTF-8 回归：中文必须完整保留' "$config"
 grep -Fq 'args = ["你好，Mac"]' "$config"
 
-printf 'macOS bind UTF-8 regression test passed.\n'
+printf 'macOS Gateway/Teamo/Official UTF-8 regression test passed.\n'
