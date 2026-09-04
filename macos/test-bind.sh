@@ -44,7 +44,7 @@ timeout_ms = 5000
 refresh_interval_ms = 300000
 TOML
 
-HOME="$test_home" CODEX_HOME="$test_home/.codex" "$script_dir/codex-app-bind" gateway >/dev/null
+HOME="$test_home" CODEX_HOME="$test_home/.codex" bash "$script_dir/codex-app-bind" gateway >/dev/null
 config="$test_home/.codex/config.toml"
 grep -Fq 'model = "gpt-5.4"' "$config"
 grep -Fq 'model_provider = "personal_gateway"' "$config"
@@ -57,7 +57,7 @@ if grep -Fq 'https://old.invalid/v1' "$config"; then
   exit 1
 fi
 
-HOME="$test_home" CODEX_HOME="$test_home/.codex" "$script_dir/codex-app-bind" official >/dev/null
+HOME="$test_home" CODEX_HOME="$test_home/.codex" bash "$script_dir/codex-app-bind" official >/dev/null
 grep -Fq 'model = "gpt-5.6-sol"' "$config"
 grep -Fq 'model_provider = "openai"' "$config"
 grep -Fq '# UTF-8 回归：中文必须完整保留' "$config"
