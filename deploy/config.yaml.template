@@ -1,0 +1,87 @@
+# Bootstrap reference only. Never copy or render this file over an existing
+# /opt/codex-personal-stage/config.yaml. Production updates must use the safe
+# read/merge/validate/backup/atomic-write flow in merge-relay-config.py.
+host: "127.0.0.1"
+port: 18317
+
+tls:
+  enable: false
+  cert: ""
+  key: ""
+
+remote-management:
+  allow-remote: false
+  secret-key: __MANAGEMENT_KEY_YAML__
+  disable-control-panel: true
+  disable-auto-update-panel: true
+
+auth-dir: "/opt/codex-personal-stage/auth"
+
+api-keys:
+  - __API_KEY_YAML__
+
+openai-compatibility:
+  - name: "teamorouter"
+    prefix: "teamo"
+    base-url: "https://api.teamorouter.cn/v1"
+    api-key-entries:
+      - api-key: __TEAMOROUTER_API_KEY_YAML__
+    models:
+      - name: "gpt-5.6-sol"
+        alias: "gpt-5.6-sol"
+        display-name: "GPT-5.6 Sol · TeamoRouter"
+        input-modalities: [text, image]
+        output-modalities: [text]
+      - name: "gpt-5.6-terra"
+        alias: "gpt-5.6-terra"
+        display-name: "GPT-5.6 Terra · TeamoRouter"
+        input-modalities: [text, image]
+        output-modalities: [text]
+      - name: "gpt-5.6-luna"
+        alias: "gpt-5.6-luna"
+        display-name: "GPT-5.6 Luna · TeamoRouter"
+        input-modalities: [text, image]
+        output-modalities: [text]
+
+  - name: "linapi"
+    prefix: "linapi"
+    base-url: "https://api.linapi.net/v1"
+    api-key-entries:
+      - api-key: __LINAPI_API_KEY_YAML__
+    models:
+      - name: "gpt-5.6-sol"
+        alias: "gpt-5.6-sol"
+        display-name: "GPT-5.6 Sol · LinAPI"
+        input-modalities: [text, image]
+        output-modalities: [text]
+      - name: "gpt-5.6-terra"
+        alias: "gpt-5.6-terra"
+        display-name: "GPT-5.6 Terra · LinAPI"
+        input-modalities: [text, image]
+        output-modalities: [text]
+      - name: "gpt-5.6-luna"
+        alias: "gpt-5.6-luna"
+        display-name: "GPT-5.6 Luna · LinAPI"
+        input-modalities: [text, image]
+        output-modalities: [text]
+
+debug: false
+pprof:
+  enable: false
+  addr: "127.0.0.1:18316"
+
+plugins:
+  enabled: true
+  dir: "/opt/codex-personal-stage/plugins"
+  configs:
+    cpa-account-config-manager:
+      enabled: true
+      priority: 20
+      workers: 1
+      data_dir: "/opt/codex-personal-stage/data/cpa-account-config-manager"
+      management_base_url: "http://127.0.0.1:18317"
+
+commercial-mode: false
+logging-to-file: false
+usage-statistics-enabled: false
+redis-usage-queue-retention-seconds: 60

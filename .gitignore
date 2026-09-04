@@ -1,0 +1,27 @@
+# Local caches and toolchains
+.cache/
+.toolchains/
+**/node_modules/
+**/__pycache__/
+
+# Build outputs and generated artifacts
+**/dist/
+**/build/
+*.so
+*.dll
+*.dylib
+*.exe
+*.pyc
+*.map
+
+# Runtime and secret material
+.env
+.env.*
+*.pem
+*.key
+*.crt
+**/auths/
+**/data/
+
+# Nested source repositories are vendored as source snapshots; do not include their Git metadata
+**/.git/

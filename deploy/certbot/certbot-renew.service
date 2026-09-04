@@ -1,0 +1,12 @@
+[Unit]
+Description=Renew Let's Encrypt IP certificates
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/certbot/bin/certbot renew --quiet
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=256M
+TasksMax=64

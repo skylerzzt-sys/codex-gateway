@@ -1,0 +1,26 @@
+[Unit]
+Description=Codex Personal Gateway Phase 1 (loopback only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/codex-personal-stage
+ExecStart=/opt/codex-personal-stage/app/cli-proxy-api -config /opt/codex-personal-stage/config.yaml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+LimitNOFILE=65535
+MemoryHigh=384M
+MemoryMax=512M
+TasksMax=256
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/codex-personal-stage
+
+[Install]
+WantedBy=multi-user.target
