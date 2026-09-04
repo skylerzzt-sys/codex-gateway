@@ -1,0 +1,704 @@
+import { getSession } from "../store/session";
+import type {
+  AccountDeletePreview,
+  AccountDeleteResult,
+	AccountTokenRefreshResult,
+  AccountDeduplicationPreview,
+  AccountDeduplicationOptions,
+	AccountEditableConfig,
+	AccountConcurrencyAvailability,
+  AccountFilters,
+  AccountExportFormat,
+  AccountListResponse,
+  AccountSort,
+	AccountModelCatalogResponse,
+  AccountPatch,
+	CPAServerVersionSnapshot,
+	ExperimentalSettings,
+	ExperimentalSettingsSnapshot,
+	AgentIdentitySessionLoginResponse,
+  ExportFormat,
+  ImportPreview,
+  ImportResult,
+  ModelTestResult,
+  OperationEntry,
+  OperationExportFormat,
+  OperationFilters,
+  OperationListResponse,
+  OperationRetentionSettings,
+	PluginInstallResult,
+	PersonalGatewayRouting,
+	GatewayMode,
+	GatewaySelection,
+  PluginStoreResponse,
+	QuotaMetadataResponse,
+  ResultExportFormat,
+  TargetScope,
+  UpdateSnapshot,
+} from "../types";
+
+const API_ROOT = "/v0/management/plugins/cpa-account-config-manager";
+
+export class APIError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function buildURL(path: string, query?: URLSearchParams): string {
+  const session = getSession();
+  if (!session) throw new APIError(401, "ui.management_key_is_not_set");
+  const suffix = query && query.size > 0 ? `?${query.toString()}` : "";
+  return `${session.baseUrl}${API_ROOT}${path}${suffix}`;
+}
+
+async function request<T>(path: string, init: RequestInit = {}, query?: URLSearchParams): Promise<T> {
+  const session = getSession();
+  if (!session) throw new APIError(401, "ui.management_key_is_not_set");
+  const headers = new Headers(init.headers);
+  headers.set("Accept", "application/json");
+  headers.set("Authorization", `Bearer ${session.managementKey}`);
+  const isFormData = typeof FormData !== "undefined" && init.body instanceof FormData;
+  if (init.body && !isFormData && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  const response = await fetch(buildURL(path, query), {
+    ...init,
+    headers,
+  });
+  if (!response.ok) {
+    let message = `Request failed (${response.status})`;
+    try {
+      const body = (await response.json()) as { error?: string; message?: string };
+      if (body.message || body.error) message = body.message || body.error || message;
+    } catch {
+      // Keep the status-only error when the response is not JSON.
+    }
+    throw new APIError(response.status, message);
+  }
+  return (await response.json()) as T;
+}
+
+function buildManagementURL(path: string): string {
+  const session = getSession();
+  if (!session) throw new APIError(401, "ui.management_key_is_not_set");
+  return `${session.baseUrl}/v0/management${path}`;
+}
+
+async function managementRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const session = getSession();
+  if (!session) throw new APIError(401, "ui.management_key_is_not_set");
+  const headers = new Headers(init.headers);
+  headers.set("Accept", "application/json");
+  headers.set("Authorization", `Bearer ${session.managementKey}`);
+  if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  const response = await fetch(buildManagementURL(path), { ...init, headers });
+  if (!response.ok) {
+    let message = `Request failed (${response.status})`;
+    try {
+      const body = (await response.json()) as { error?: string; message?: string };
+      message = body.error === "plugin_update_requires_restart" ? body.error : body.message || body.error || message;
+    } catch {
+      // Keep the status-only error when the response is not JSON.
+    }
+    throw new APIError(response.status, message);
+  }
+  return (await response.json()) as T;
+}
+
+interface ParsedCPAServerVersion {
+  core: [number, number, number];
+  prerelease: string[];
+}
+
+function safeCPAVersionLabel(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 64 || !/^[A-Za-z0-9][A-Za-z0-9._+-]*$/.test(trimmed)) return "";
+  return /^v?\d+\.\d+\.\d+(?:[-+].+)?$/i.test(trimmed)
+    ? `v${trimmed.replace(/^v/i, "")}`
+    : trimmed;
+}
+
+function safeCPAHeaderText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  return trimmed && trimmed.length <= 96 && !/[\u0000-\u001f\u007f]/.test(trimmed) ? trimmed : "";
+}
+
+function parseCPAServerVersion(value: string): ParsedCPAServerVersion | null {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/i.exec(value.trim());
+  if (!match) return null;
+  const core = [Number(match[1]), Number(match[2]), Number(match[3])] as [number, number, number];
+  if (core.some((part) => !Number.isSafeInteger(part) || part < 0 || part > 1_000_000)) return null;
+  const prerelease = match[4] ? match[4].split(".") : [];
+  if (prerelease.some((part) => !part)) return null;
+  return { core, prerelease };
+}
+
+function comparePrereleaseIdentifiers(left: string[], right: string[]): number {
+  if (left.length === 0 || right.length === 0) {
+    if (left.length === right.length) return 0;
+    return left.length === 0 ? 1 : -1;
+  }
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const leftPart = left[index];
+    const rightPart = right[index];
+    if (leftPart === undefined || rightPart === undefined) return leftPart === undefined ? -1 : 1;
+    if (leftPart === rightPart) continue;
+    const leftNumeric = /^\d+$/.test(leftPart);
+    const rightNumeric = /^\d+$/.test(rightPart);
+    if (leftNumeric && rightNumeric) return Number(leftPart) < Number(rightPart) ? -1 : 1;
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    return leftPart < rightPart ? -1 : 1;
+  }
+  return 0;
+}
+
+export function compareCPAServerVersions(left: string, right: string): number | null {
+  const parsedLeft = parseCPAServerVersion(left);
+  const parsedRight = parseCPAServerVersion(right);
+  if (!parsedLeft || !parsedRight) return null;
+  for (let index = 0; index < parsedLeft.core.length; index += 1) {
+    if (parsedLeft.core[index] !== parsedRight.core[index]) {
+      return parsedLeft.core[index] < parsedRight.core[index] ? -1 : 1;
+    }
+  }
+  return comparePrereleaseIdentifiers(parsedLeft.prerelease, parsedRight.prerelease);
+}
+
+export async function getCPAServerVersionStatus(): Promise<CPAServerVersionSnapshot> {
+  const session = getSession();
+  if (!session) throw new APIError(401, "ui.management_key_is_not_set");
+  const headers = new Headers({ Accept: "application/json", Authorization: `Bearer ${session.managementKey}` });
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 15_000);
+  let response: Response;
+  try {
+    response = await fetch(buildManagementURL("/latest-version"), { headers, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timeout);
+  }
+  if (response.status === 401) throw new APIError(401, "ui.authentication_failed");
+
+  const currentVersion = safeCPAVersionLabel(response.headers.get("X-CPA-Version") || response.headers.get("X-Server-Version"));
+  const currentBuildDate = safeCPAHeaderText(response.headers.get("X-CPA-Build-Date") || response.headers.get("X-Server-Build-Date"));
+  let latestVersion = "";
+  if (response.ok) {
+    try {
+      const payload = await response.json() as Record<string, unknown>;
+      latestVersion = safeCPAVersionLabel(payload["latest-version"] ?? payload.latest_version ?? payload.latest);
+    } catch {
+      latestVersion = "";
+    }
+  }
+
+  const comparison = currentVersion && latestVersion ? compareCPAServerVersions(currentVersion, latestVersion) : null;
+  const error = !currentVersion
+    ? "current_version_unavailable" as const
+    : !latestVersion
+      ? "latest_version_unavailable" as const
+      : comparison === null
+        ? "version_comparison_unavailable" as const
+        : undefined;
+  return {
+    current_version: currentVersion || undefined,
+    latest_version: latestVersion || undefined,
+    current_build_date: currentBuildDate || undefined,
+    update_available: comparison !== null && comparison < 0,
+    checked_at: new Date().toISOString(),
+    release_url: latestVersion && parseCPAServerVersion(latestVersion)
+      ? `https://github.com/router-for-me/CLIProxyAPI/releases/tag/${encodeURIComponent(latestVersion)}`
+      : undefined,
+    error,
+  };
+}
+
+function arrayOrEmpty<T>(value: T[] | null | undefined): T[] {
+  return Array.isArray(value) ? value : [];
+}
+
+const legacyAccountConcurrency: AccountConcurrencyAvailability = {
+	supported: false,
+	host_schema_version: 1,
+	required_schema_version: 2,
+	reason: "host_schema_v2_required",
+};
+
+function filtersQuery(filters: AccountFilters): URLSearchParams {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === "") continue;
+    query.set(key, String(value));
+  }
+  return query;
+}
+
+export async function verifySession(): Promise<void> {
+  const query = new URLSearchParams({ page: "1", page_size: "1" });
+  await request<AccountListResponse>("/accounts", {}, query);
+}
+
+function normalizeGatewayMode(value: unknown): GatewayMode {
+	const normalized = typeof value === "string" ? value.trim().toLowerCase().replace(/[_\s-]/g, "") : "";
+	if (normalized === "forcea") return "force_a";
+	if (normalized === "forceb") return "force_b";
+	return "auto";
+}
+
+export async function getPersonalGatewayRouting(): Promise<PersonalGatewayRouting> {
+	const response = await request<Record<string, unknown>>("/config");
+	const nested = response.personal_gateway && typeof response.personal_gateway === "object"
+		? response.personal_gateway as Record<string, unknown>
+		: {};
+	const accountA = String(response.gateway_account_a_id ?? nested.account_a_id ?? "").trim();
+	const accountB = String(response.gateway_account_b_id ?? nested.account_b_id ?? "").trim();
+	return {
+		configured: accountA !== "" && accountB !== "" && accountA !== accountB,
+		account_a_id: accountA,
+		account_b_id: accountB,
+		mode: normalizeGatewayMode(response.gateway_mode ?? nested.mode),
+	};
+}
+
+export async function savePersonalGatewayMode(mode: GatewayMode): Promise<PersonalGatewayRouting> {
+	await request<unknown>("/config", { method: "PATCH", body: JSON.stringify({ gateway_mode: mode }) });
+	return getPersonalGatewayRouting();
+}
+
+export async function savePersonalGatewaySelection(selection: GatewaySelection): Promise<PersonalGatewayRouting> {
+	await request<unknown>("/config", { method: "PATCH", body: JSON.stringify({ gateway_mode: selection }) });
+	return getPersonalGatewayRouting();
+}
+
+export async function listAccounts(
+  page: number,
+  pageSize: number,
+  filters: AccountFilters,
+  sort: AccountSort = { field: "account", order: "asc" },
+): Promise<AccountListResponse> {
+  const query = filtersQuery(filters);
+  query.set("page", String(page));
+  query.set("page_size", String(pageSize));
+  query.set("sort_by", sort.field);
+  query.set("sort_order", sort.order);
+  const response = await request<AccountListResponse>("/accounts", {}, query);
+	const availability = response.account_concurrency ?? legacyAccountConcurrency;
+	return {
+		...response,
+		account_concurrency: availability,
+		accounts: arrayOrEmpty(response.accounts).map((account) => ({
+			...account,
+			concurrency: account.concurrency ?? { supported: availability.supported, active: 0, limit: 0 },
+		})),
+	};
+}
+
+export async function loadAccountConfig(accountID: string): Promise<AccountEditableConfig> {
+	const response = await request<AccountEditableConfig>("/accounts/config", {
+		method: "POST",
+		body: JSON.stringify({ account_id: accountID }),
+	});
+	const availability = response.account_concurrency ?? legacyAccountConcurrency;
+	return {
+		...response,
+		header_names: arrayOrEmpty(response.header_names),
+		account_concurrency: availability,
+		concurrency: response.concurrency ?? { supported: availability.supported, active: 0, limit: 0 },
+	};
+}
+
+export async function refreshAccountQuotaMetadata(accountID: string): Promise<QuotaMetadataResponse> {
+	return request<QuotaMetadataResponse>("/accounts/quota-metadata/refresh", {
+		method: "POST",
+		body: JSON.stringify({ account_id: accountID }),
+	});
+}
+
+export async function useAccountActiveReset(accountID: string): Promise<QuotaMetadataResponse> {
+	return request<QuotaMetadataResponse>("/accounts/quota-metadata/reset", {
+		method: "POST",
+		body: JSON.stringify({ account_id: accountID, confirm: true }),
+	});
+}
+
+export async function testAccountModel(accountID: string, model: string, experimentalWeeklyOverdraft = false): Promise<ModelTestResult> {
+  return request<ModelTestResult>("/accounts/model-test", {
+    method: "POST",
+    body: JSON.stringify({
+      account_id: accountID,
+      model: model.trim(),
+      ...(experimentalWeeklyOverdraft ? { experimental_weekly_overdraft: true } : {}),
+    }),
+  });
+}
+
+export async function refreshAccountToken(accountID: string): Promise<AccountTokenRefreshResult> {
+	return request<AccountTokenRefreshResult>("/accounts/token/refresh", {
+		method: "POST",
+		body: JSON.stringify({ account_id: accountID }),
+	});
+}
+
+export async function loadAccountModels(scope: TargetScope): Promise<AccountModelCatalogResponse> {
+	const response = await request<AccountModelCatalogResponse>("/accounts/models", {
+		method: "POST",
+		body: JSON.stringify({ scope }),
+	});
+	return { ...response, models: arrayOrEmpty(response.models), warnings: arrayOrEmpty(response.warnings) };
+}
+
+export async function createAccountDeletePreview(accountID: string): Promise<AccountDeletePreview> {
+  return request<AccountDeletePreview>("/accounts/delete/preview", {
+    method: "POST",
+    body: JSON.stringify({ id: accountID }),
+  });
+}
+
+export async function deleteAccount(previewID: string): Promise<AccountDeleteResult> {
+  return request<AccountDeleteResult>("/accounts/delete/start", {
+    method: "POST",
+    body: JSON.stringify({ preview_id: previewID }),
+  });
+}
+
+export async function updateAccount(accountID: string, patch: AccountPatch): Promise<void> {
+  await request("/accounts/status", {
+    method: "POST",
+    body: JSON.stringify({ account_id: accountID, ...patch }),
+  });
+}
+
+export async function scanAccountDuplicates(options: AccountDeduplicationOptions): Promise<AccountDeduplicationPreview> {
+  return request<AccountDeduplicationPreview>("/accounts/deduplicate/preview", {
+    method: "POST",
+    body: JSON.stringify(options),
+  });
+}
+
+interface PersistentPluginSettings {
+	operation_settings?: Pick<OperationRetentionSettings, "extended_history">;
+	experimental_settings?: ExperimentalSettings;
+}
+
+async function persistPluginSettings(settings: PersistentPluginSettings): Promise<void> {
+	try {
+		await request<unknown>("/config", {
+			method: "PATCH",
+			body: JSON.stringify(settings),
+		});
+	} catch (error) {
+		if (error instanceof APIError) throw new APIError(error.status, "ui.settings_persistence_failed");
+		throw error;
+	}
+}
+
+export async function getUpdateStatus(): Promise<UpdateSnapshot> {
+  return request<UpdateSnapshot>("/updates");
+}
+
+export async function getExperimentalSettings(): Promise<ExperimentalSettingsSnapshot> {
+	return request<ExperimentalSettingsSnapshot>("/experiments");
+}
+
+export async function saveExperimentalSettings(settings: ExperimentalSettings): Promise<ExperimentalSettingsSnapshot> {
+	await persistPluginSettings({ experimental_settings: settings });
+	return request<ExperimentalSettingsSnapshot>("/experiments", {
+		method: "PUT",
+		body: JSON.stringify(settings),
+	});
+}
+
+export async function completeAgentIdentitySessionLogin(state: string, sessionJSON: string): Promise<AgentIdentitySessionLoginResponse> {
+	return request<AgentIdentitySessionLoginResponse>("/experiments/agent-identity/session-login", {
+		method: "POST",
+		body: JSON.stringify({ state, session_json: sessionJSON }),
+	});
+}
+
+export async function checkForUpdates(): Promise<UpdateSnapshot> {
+  return request<UpdateSnapshot>("/updates/check", { method: "POST" });
+}
+
+export async function getPluginStore(): Promise<PluginStoreResponse> {
+  const response = await managementRequest<PluginStoreResponse>("/plugin-store");
+  return { ...response, plugins: arrayOrEmpty(response.plugins) };
+}
+
+const pluginID = "cpa-account-config-manager";
+const pluginReleaseBaseURL = "https://github.com/Mxucc/cpa-account-config-manager/releases/tag/v";
+
+function normalizedStableVersion(value: string | undefined): { value: string; parts: [number, number, number] } | null {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec((value ?? "").trim());
+  if (!match) return null;
+  const parts = [Number(match[1]), Number(match[2]), Number(match[3])] as [number, number, number];
+  if (parts.some((part) => !Number.isSafeInteger(part))) return null;
+  return { value: parts.join("."), parts };
+}
+
+function compareStableVersions(left: [number, number, number], right: [number, number, number]): number {
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return left[index] - right[index];
+  }
+  return 0;
+}
+
+export function reconcileUpdateStatus(status: UpdateSnapshot, store: PluginStoreResponse | null, storeError = ""): UpdateSnapshot {
+  const obsoleteDirectCheckErrors = new Set([
+    "release metadata request failed",
+    "release metadata response was invalid",
+    "repository metadata is invalid",
+    "update check is unavailable",
+  ]);
+  const statusError = status.error?.trim() || "";
+  const retainedError = obsoleteDirectCheckErrors.has(statusError) ? "" : statusError;
+  const currentVersion = normalizedStableVersion(status.current_version);
+  const plugin = store?.plugins_enabled ? arrayOrEmpty(store.plugins).find((entry) => entry?.id === pluginID) : undefined;
+  const storeVersion = normalizedStableVersion(plugin?.version);
+  const base: UpdateSnapshot = {
+    policy: status.policy,
+    current_version: status.current_version,
+    update_available: false,
+    checking: status.checking,
+    pending: status.pending,
+    checked_at: status.checked_at,
+    release_source: "none",
+    store_error: storeError ? "plugin store metadata is unavailable" : undefined,
+    error: retainedError || undefined,
+    runtime: status.runtime,
+  };
+
+  if (!storeVersion || !currentVersion) {
+    return {
+      ...base,
+      error: retainedError || "plugin store metadata is unavailable",
+    };
+  }
+  const storeIsNewer = compareStableVersions(storeVersion.parts, currentVersion.parts) > 0;
+
+  return {
+    ...base,
+    latest_version: storeVersion.value,
+    update_available: storeIsNewer,
+    release_url: `${pluginReleaseBaseURL}${storeVersion.value}`,
+    release_source: "plugin_store",
+    error: retainedError || undefined,
+  };
+}
+
+async function loadPluginStore(): Promise<{ response: PluginStoreResponse | null; error: string }> {
+  return getPluginStore().then(
+    (response) => ({ response, error: "" }),
+    () => ({ response: null, error: "plugin store metadata is unavailable" }),
+  );
+}
+
+export async function getEffectiveUpdateStatus(checkNow = false): Promise<UpdateSnapshot> {
+  const [status, store] = await Promise.all([
+    checkNow ? checkForUpdates() : getUpdateStatus(),
+    loadPluginStore(),
+  ]);
+  return reconcileUpdateStatus(status, store.response, store.error);
+}
+
+export async function installPluginUpdate(version: string): Promise<PluginInstallResult> {
+  try {
+    const requestedVersion = normalizedStableVersion(version);
+    if (!requestedVersion) {
+      throw new APIError(400, "plugin store install response was invalid");
+    }
+    const store = await getPluginStore();
+    const plugin = store.plugins_enabled ? arrayOrEmpty(store.plugins).find((entry) => entry.id === pluginID) : undefined;
+    const storeVersion = normalizedStableVersion(plugin?.version);
+    if (!plugin || !storeVersion || compareStableVersions(storeVersion.parts, requestedVersion.parts) !== 0) {
+      throw new APIError(404, "ui.the_account_manager_plugin_was_not_found_in_the_plugin_store");
+    }
+    const installed = await managementRequest<PluginInstallResult>("/plugin-store/cpa-account-config-manager/install", {
+      method: "POST",
+      body: JSON.stringify({ version: requestedVersion.value }),
+    });
+    const installedVersion = normalizedStableVersion(installed.version);
+    if (installed.status !== "installed" || installed.id !== pluginID || !installedVersion ||
+      compareStableVersions(installedVersion.parts, requestedVersion.parts) !== 0) {
+      throw new APIError(502, "plugin store install response was invalid");
+    }
+    const result: PluginInstallResult = {
+      status: "installed",
+      id: pluginID,
+      version: installedVersion.value,
+      restart_required: installed.restart_required === true,
+    };
+    await recordBrowserOperation("update_install", result.restart_required ? "warning" : "succeeded", result.version).catch(() => undefined);
+    return result;
+  } catch (error) {
+    await recordBrowserOperation("update_install", "failed", version).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function recordBrowserOperation(action: "update_install", status: "succeeded" | "failed" | "warning", version?: string): Promise<void> {
+  const controller = new AbortController();
+  const timeout = globalThis.setTimeout(() => controller.abort(), 3_000);
+  try {
+    await request("/operations/record", {
+      method: "POST",
+      body: JSON.stringify({ action, status, version }),
+      signal: controller.signal,
+    });
+  } finally {
+    globalThis.clearTimeout(timeout);
+  }
+}
+
+export async function listOperations(page: number, filters: OperationFilters = {}, signal?: AbortSignal): Promise<OperationListResponse> {
+  const query = new URLSearchParams({ page: String(page), page_size: "500" });
+  if (filters.category) query.set("category", filters.category);
+  if (filters.status) query.set("status", filters.status);
+  if (filters.source) query.set("source", filters.source);
+  if (filters.search) query.set("search", filters.search);
+  const controller = new AbortController();
+  const abortFromCaller = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  else signal?.addEventListener("abort", abortFromCaller, { once: true });
+  const timeout = globalThis.setTimeout(() => controller.abort(), 15_000);
+  let response: OperationListResponse;
+  try {
+    response = await request<OperationListResponse>("/operations", { signal: controller.signal }, query);
+  } finally {
+    globalThis.clearTimeout(timeout);
+    signal?.removeEventListener("abort", abortFromCaller);
+  }
+  const total = Number.isFinite(response.total) ? Math.max(0, response.total) : 0;
+  return {
+    ...response,
+    operations: arrayOrEmpty(response.operations),
+    total,
+    page_size: 500,
+    extended_history: response.extended_history === true,
+    archived_segments: Number.isFinite(response.archived_segments) ? Math.max(0, response.archived_segments) : 0,
+    retention_limit: 500,
+    retained: Number.isFinite(response.retained) ? Math.max(0, response.retained) : total,
+  };
+}
+
+export async function saveOperationRetentionSettings(extendedHistory: boolean): Promise<OperationRetentionSettings> {
+	await persistPluginSettings({ operation_settings: { extended_history: extendedHistory } });
+  return request<OperationRetentionSettings>("/operations/settings", {
+    method: "PUT",
+    body: JSON.stringify({ extended_history: extendedHistory }),
+  });
+}
+
+export async function getOperationRetentionSettings(): Promise<OperationRetentionSettings> {
+	return request<OperationRetentionSettings>("/operations/settings");
+}
+
+export async function clearOperations(): Promise<{ operation: OperationEntry; retained: number }> {
+  return request<{ operation: OperationEntry; retained: number }>("/operations", { method: "DELETE" });
+}
+
+export async function downloadOperationExport(format: OperationExportFormat, filters: OperationFilters = {}): Promise<{ filename: string; exported?: number }> {
+  const session = getSession();
+  if (!session) throw new APIError(401, "ui.management_key_is_not_set");
+  const query = new URLSearchParams({ format });
+  if (filters.category) query.set("category", filters.category);
+  if (filters.status) query.set("status", filters.status);
+  if (filters.source) query.set("source", filters.source);
+  if (filters.search) query.set("search", filters.search);
+  const response = await fetch(buildURL("/operations/export", query), {
+    headers: { Authorization: `Bearer ${session.managementKey}` },
+  });
+  if (!response.ok) {
+    let message = `Export failed (${response.status})`;
+    try {
+      const body = (await response.json()) as { error?: string };
+      if (body.error) message = body.error;
+    } catch {
+      // Keep the status-only error when the response is not JSON.
+    }
+    throw new APIError(response.status, message);
+  }
+  const disposition = response.headers.get("Content-Disposition") ?? "";
+  const match = disposition.match(/filename="?([^";]+)"?/i);
+  const filename = match?.[1] ?? `cpa-account-operations.${format}`;
+  const href = URL.createObjectURL(await response.blob());
+  const anchor = document.createElement("a");
+  anchor.href = href;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(href);
+  return { filename, exported: numericHeader(response.headers.get("X-Exported-Operations")) };
+}
+
+export async function createImportPreview(files: File[]): Promise<ImportPreview> {
+  const body = new FormData();
+  files.forEach((file) => body.append("files", file, file.name));
+  return request<ImportPreview>("/import/preview", {
+    method: "POST",
+    body,
+  });
+}
+
+export async function startImport(previewID: string): Promise<ImportResult> {
+  return request<ImportResult>("/import/start", {
+    method: "POST",
+    body: JSON.stringify({ preview_id: previewID }),
+  });
+}
+
+export async function getImportStatus(): Promise<ImportResult> {
+  const result = await request<ImportResult>("/import/status");
+  return { ...result, results: arrayOrEmpty(result.results) };
+}
+
+export interface ExportDownloadResult {
+  filename: string;
+  exported?: number;
+  skipped?: number;
+}
+
+export async function downloadExport(kind: "accounts", format: AccountExportFormat, scope?: TargetScope): Promise<ExportDownloadResult>;
+export async function downloadExport(kind: "results", format: ResultExportFormat, filters?: undefined): Promise<ExportDownloadResult>;
+export async function downloadExport(kind: "accounts" | "results", format: ExportFormat, scope?: TargetScope): Promise<ExportDownloadResult> {
+  const session = getSession();
+  if (!session) throw new APIError(401, "ui.management_key_is_not_set");
+  const query = kind === "accounts" && scope?.mode === "filtered" ? filtersQuery(scope.filters ?? {}) : new URLSearchParams();
+  query.set("format", format);
+  const headers = new Headers({ Authorization: `Bearer ${session.managementKey}` });
+  const selected = kind === "accounts" && scope?.mode === "selected";
+  if (selected) headers.set("Content-Type", "application/json");
+  const response = await fetch(buildURL(`/export/${kind}`, query), {
+    method: selected ? "POST" : "GET",
+    headers,
+    ...(selected ? { body: JSON.stringify({ scope }) } : {}),
+  });
+  if (!response.ok) {
+    let message = `Export failed (${response.status})`;
+    try {
+      const body = (await response.json()) as { error?: string };
+      if (body.error) message = body.error;
+    } catch {
+      // Keep the status-only error when the response is not JSON.
+    }
+    throw new APIError(response.status, message);
+  }
+  const disposition = response.headers.get("Content-Disposition") ?? "";
+  const match = disposition.match(/filename="?([^";]+)"?/i);
+  const filename = match?.[1] ?? `cpa-account-config-${kind}.${format}`;
+  const href = URL.createObjectURL(await response.blob());
+  const anchor = document.createElement("a");
+  anchor.href = href;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(href);
+  const exported = numericHeader(response.headers.get("X-Exported-Accounts"));
+  const skipped = numericHeader(response.headers.get("X-Skipped-Accounts"));
+  return { filename, exported, skipped };
+}
+
+function numericHeader(value: string | null): number | undefined {
+  if (value === null || value.trim() === "") return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}

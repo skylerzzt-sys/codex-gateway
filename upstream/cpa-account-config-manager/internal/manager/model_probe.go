@@ -1,0 +1,1332 @@
+package manager
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+
+	"cpa-account-config-manager/internal/cpaapi"
+)
+
+const (
+	modelTestTimeout            = 20 * time.Second
+	maxModelTestResponseBytes   = 256 << 10
+	maxModelTestBodyBytes       = 128 << 10
+	maxModelIdentifierLength    = 128
+	defaultOpenAIProbeModel     = "gpt-5.6-sol"
+	defaultCodexFallbackModel   = "gpt-5.5"
+	codexCompatibilityMiniModel = "gpt-5.4-mini"
+)
+
+var (
+	ErrModelTestBusy            = errors.New("too many model tests are running")
+	ErrModelTestAccountNotFound = errors.New("account was not found")
+)
+
+type ModelTestRequest struct {
+	AccountID                   string `json:"account_id"`
+	Model                       string `json:"model,omitempty"`
+	ExperimentalWeeklyOverdraft bool   `json:"experimental_weekly_overdraft,omitempty"`
+	DetectRestrictedModels      bool   `json:"-"`
+}
+
+type ModelTestResult struct {
+	AccountID        string                     `json:"account_id"`
+	Provider         string                     `json:"provider"`
+	Model            string                     `json:"model"`
+	PrimaryModel     string                     `json:"primary_model,omitempty"`
+	FallbackModel    string                     `json:"fallback_model,omitempty"`
+	SelectedModel    string                     `json:"selected_model,omitempty"`
+	FallbackUsed     bool                       `json:"fallback_used,omitempty"`
+	Status           string                     `json:"status"`
+	ProbeKind        string                     `json:"probe_kind"`
+	ReasonCode       string                     `json:"reason_code"`
+	StatusCode       int                        `json:"status_code,omitempty"`
+	QuotaWindow      string                     `json:"quota_window,omitempty"`
+	LatencyMS        int64                      `json:"latency_ms"`
+	TestedAt         time.Time                  `json:"tested_at"`
+	Response         *ModelTestResponsePreview  `json:"response,omitempty"`
+	Experiment       *ModelTestExperiment       `json:"experiment,omitempty"`
+	Attempts         []ModelTestAttempt         `json:"attempts,omitempty"`
+	CompatibleModels []string                   `json:"compatible_models,omitempty"`
+	ModelPolicy      *ModelTestPolicyAdjustment `json:"model_policy,omitempty"`
+}
+
+type ModelTestPolicyAdjustment struct {
+	Mode       string   `json:"mode"`
+	Models     []string `json:"models"`
+	Status     string   `json:"status"`
+	ReasonCode string   `json:"reason_code"`
+}
+
+type ModelTestAttempt struct {
+	Model       string                    `json:"model"`
+	Role        string                    `json:"role"`
+	Status      string                    `json:"status"`
+	ProbeKind   string                    `json:"probe_kind"`
+	ReasonCode  string                    `json:"reason_code"`
+	StatusCode  int                       `json:"status_code,omitempty"`
+	QuotaWindow string                    `json:"quota_window,omitempty"`
+	LatencyMS   int64                     `json:"latency_ms"`
+	TestedAt    time.Time                 `json:"tested_at"`
+	Response    *ModelTestResponsePreview `json:"response,omitempty"`
+	Experiment  *ModelTestExperiment      `json:"experiment,omitempty"`
+}
+
+type ModelTestExperiment struct {
+	Name    string `json:"name"`
+	Applied bool   `json:"applied"`
+	CallID  string `json:"call_id,omitempty"`
+}
+
+type ModelTestResponsePreview struct {
+	Format    string                    `json:"format"`
+	Body      string                    `json:"body"`
+	Headers   []ModelTestResponseHeader `json:"headers"`
+	Truncated bool                      `json:"truncated"`
+}
+
+type ModelTestResponseHeader struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type ModelTestService struct {
+	accounts                *AccountService
+	usage                   credentialUsageObserver
+	overdraft               overdraftCycleObserver
+	agentIdentity           *AgentIdentityExperiment
+	doer                    HTTPDoer
+	semaphore               chan struct{}
+	now                     func() time.Time
+	experimentalTransformer RequestTransformer
+}
+
+type credentialUsageObserver interface {
+	ObserveCredentialUsage(string, *CodexUsageSnapshot)
+}
+
+type overdraftCycleObserver interface {
+	BeginOverdraftCycle(string, string, time.Time)
+}
+
+type requestInterceptionActivation interface {
+	RequestInterceptionActive() bool
+}
+
+type modelProbe struct {
+	kind    string
+	method  string
+	url     string
+	headers map[string]string
+	data    string
+}
+
+type modelTestAuthMetadata struct {
+	hasAPIKey      bool
+	hasAccessToken bool
+	accountID      string
+	baseURL        string
+	projectID      string
+	location       string
+}
+
+type managementAPICallRequest struct {
+	AuthIndex string            `json:"auth_index"`
+	Method    string            `json:"method"`
+	URL       string            `json:"url"`
+	Header    map[string]string `json:"header"`
+	Data      string            `json:"data"`
+}
+
+type managementAPICallResponse struct {
+	StatusCode int                   `json:"status_code"`
+	Header     map[string][]string   `json:"header"`
+	Body       managementAPICallBody `json:"body"`
+}
+
+type managementAPICallBody string
+
+type modelProbeHTTPResponse struct {
+	StatusCode int
+	Header     map[string][]string
+	Body       []byte
+}
+
+func (r *managementAPICallResponse) UnmarshalJSON(raw []byte) error {
+	var envelope struct {
+		StatusCode      json.RawMessage       `json:"status_code"`
+		StatusCodeCamel json.RawMessage       `json:"statusCode"`
+		Header          map[string][]string   `json:"header"`
+		Body            managementAPICallBody `json:"body"`
+	}
+	if errDecode := json.Unmarshal(raw, &envelope); errDecode != nil {
+		return errDecode
+	}
+	statusRaw := envelope.StatusCode
+	if len(bytes.TrimSpace(statusRaw)) == 0 {
+		statusRaw = envelope.StatusCodeCamel
+	}
+	statusCode, errStatus := decodeManagementStatusCode(statusRaw)
+	if errStatus != nil {
+		return errStatus
+	}
+	*r = managementAPICallResponse{StatusCode: statusCode, Header: envelope.Header, Body: envelope.Body}
+	return nil
+}
+
+func decodeManagementStatusCode(raw json.RawMessage) (int, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return 0, nil
+	}
+	var value any
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.UseNumber()
+	if errDecode := decoder.Decode(&value); errDecode != nil {
+		return 0, fmt.Errorf("decode upstream status code: %w", errDecode)
+	}
+	var text string
+	switch typed := value.(type) {
+	case json.Number:
+		text = typed.String()
+	case string:
+		text = strings.TrimSpace(typed)
+	default:
+		return 0, fmt.Errorf("upstream status code must be a number or numeric string")
+	}
+	number, errParse := strconv.ParseFloat(text, 64)
+	if errParse != nil || math.IsNaN(number) || math.IsInf(number, 0) || number != math.Trunc(number) {
+		return 0, fmt.Errorf("upstream status code is invalid")
+	}
+	if number < 100 || number > 599 {
+		return 0, fmt.Errorf("upstream status code is outside the HTTP range")
+	}
+	return int(number), nil
+}
+
+type codexUsageProbeEnvelope struct {
+	RateLimit      *codexUsageProbeLimit `json:"rate_limit"`
+	RateLimitCamel *codexUsageProbeLimit `json:"rateLimit"`
+}
+
+type codexUsageProbeLimit struct {
+	Allowed              *bool                  `json:"allowed"`
+	LimitReached         *bool                  `json:"limit_reached"`
+	LimitReachedCamel    *bool                  `json:"limitReached"`
+	PrimaryWindow        *codexUsageProbeWindow `json:"primary_window"`
+	PrimaryWindowCamel   *codexUsageProbeWindow `json:"primaryWindow"`
+	SecondaryWindow      *codexUsageProbeWindow `json:"secondary_window"`
+	SecondaryWindowCamel *codexUsageProbeWindow `json:"secondaryWindow"`
+}
+
+type codexUsageProbeWindow struct {
+	UsedPercent             *float64 `json:"used_percent"`
+	UsedPercentCamel        *float64 `json:"usedPercent"`
+	LimitWindowSeconds      *float64 `json:"limit_window_seconds"`
+	LimitWindowSecondsCamel *float64 `json:"limitWindowSeconds"`
+	ResetAfterSeconds       *float64 `json:"reset_after_seconds"`
+	ResetAfterSecondsCamel  *float64 `json:"resetAfterSeconds"`
+	ResetAt                 *float64 `json:"reset_at"`
+	ResetAtCamel            *float64 `json:"resetAt"`
+}
+
+func (b *managementAPICallBody) UnmarshalJSON(raw []byte) error {
+	trimmed := bytes.TrimSpace(raw)
+	if bytes.Equal(trimmed, []byte("null")) {
+		*b = ""
+		return nil
+	}
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var text string
+		if errDecode := json.Unmarshal(trimmed, &text); errDecode != nil {
+			return errDecode
+		}
+		*b = managementAPICallBody(text)
+		return nil
+	}
+	if !json.Valid(trimmed) {
+		return fmt.Errorf("api-call body is not valid JSON")
+	}
+	var compact bytes.Buffer
+	if errCompact := json.Compact(&compact, trimmed); errCompact != nil {
+		return errCompact
+	}
+	*b = managementAPICallBody(compact.String())
+	return nil
+}
+
+func NewModelTestService(accounts *AccountService, usage ...credentialUsageObserver) *ModelTestService {
+	service := &ModelTestService{
+		accounts:  accounts,
+		semaphore: make(chan struct{}, 4),
+		now:       time.Now,
+	}
+	if len(usage) > 0 {
+		service.usage = usage[0]
+		if observer, ok := usage[0].(overdraftCycleObserver); ok {
+			service.overdraft = observer
+		}
+	}
+	return service
+}
+
+func (s *ModelTestService) SetExperimentalTransformer(transformer RequestTransformer) {
+	if s == nil {
+		return
+	}
+	s.experimentalTransformer = transformer
+}
+
+func (s *ModelTestService) SetAgentIdentityExperiment(experiment *AgentIdentityExperiment) {
+	if s == nil {
+		return
+	}
+	s.agentIdentity = experiment
+}
+
+func (s *ModelTestService) Run(ctx context.Context, request ModelTestRequest, managementBaseURL, managementKey string, hostCallbackID ...string) (ModelTestResult, error) {
+	accountID := safeOperationIdentifier(request.AccountID, 256)
+	if accountID == "" {
+		return ModelTestResult{}, fmt.Errorf("account_id is required and must be at most 256 characters")
+	}
+	model := strings.TrimSpace(request.Model)
+	if model != "" && safeModelIdentifier(model) == "" {
+		return ModelTestResult{}, fmt.Errorf("model contains unsupported characters or exceeds 128 characters")
+	}
+	if s == nil || s.accounts == nil {
+		return ModelTestResult{}, fmt.Errorf("account service is unavailable")
+	}
+	select {
+	case s.semaphore <- struct{}{}:
+		defer func() { <-s.semaphore }()
+	default:
+		return ModelTestResult{}, ErrModelTestBusy
+	}
+
+	resolved, errResolve := s.accounts.ResolveTargets(ctx, TargetScope{Mode: "selected", IDs: []string{accountID}})
+	if errResolve != nil {
+		return ModelTestResult{}, fmt.Errorf("resolve model-test account: %w", errResolve)
+	}
+	if len(resolved.Accounts) != 1 {
+		return ModelTestResult{}, ErrModelTestAccountNotFound
+	}
+	account := resolved.Accounts[0]
+	provider := strings.ToLower(strings.TrimSpace(firstNonEmpty(account.Provider, account.Type)))
+	probeProvider := provider
+	if provider == agentIdentityProvider {
+		probeProvider = "codex"
+	}
+	metadata := s.authMetadata(ctx, account.ID)
+	if !metadata.hasAccessToken && accountTypeUsesAPIKey(account.AccountType) {
+		metadata.hasAPIKey = true
+	}
+	startedAt := s.currentTime()
+	result := ModelTestResult{
+		AccountID: account.ID,
+		Provider:  provider,
+		Model:     model,
+		TestedAt:  startedAt,
+	}
+	if request.ExperimentalWeeklyOverdraft && (probeProvider != "codex" || metadata.usesAPIKey()) {
+		return ModelTestResult{}, fmt.Errorf("weekly overdraft experiment requires a Codex OAuth account")
+	}
+	probe, selectedModel, supported, errProbe := buildModelProbe(probeProvider, model, metadata)
+	if errProbe != nil {
+		return ModelTestResult{}, errProbe
+	}
+	result.Model = selectedModel
+	result.PrimaryModel = selectedModel
+	result.ProbeKind = ModelProbeKindModel
+	if !supported {
+		result.Status = "unsupported"
+		result.ReasonCode = "unsupported_provider"
+		return result, nil
+	}
+	resolution := resolveAccountProbeModel(selectedModel, probeProvider, account.ModelPolicy, false)
+	if !resolution.Allowed {
+		result.Status = "unsupported"
+		result.ReasonCode = "model_blocked_by_account_policy"
+		return result, nil
+	}
+	if resolution.Replaced {
+		probe, selectedModel, supported, errProbe = buildModelProbe(probeProvider, resolution.Model, metadata)
+		if errProbe != nil {
+			return ModelTestResult{}, errProbe
+		}
+		if !supported {
+			result.Status = "unsupported"
+			result.ReasonCode = "unsupported_provider"
+			return result, nil
+		}
+		result.Model = selectedModel
+		result.PrimaryModel = selectedModel
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, modelTestTimeout)
+	defer cancel()
+	callbackID := ""
+	if len(hostCallbackID) > 0 {
+		callbackID = strings.TrimSpace(hostCallbackID[0])
+	}
+	if probeProvider == "codex" && !request.ExperimentalWeeklyOverdraft && !metadata.usesAPIKey() {
+		credential := buildCodexCredentialProbe(metadata)
+		credentialResponse, errCredential := s.callAccountProbe(probeCtx, managementBaseURL, managementKey, callbackID, account, credential)
+		if errCredential == nil {
+			statusCode, body := credentialResponse.StatusCode, credentialResponse.Body
+			if s.usage != nil {
+				s.usage.ObserveCredentialUsage(account.ID, codexUsageProbeSnapshot(body, s.currentTime()))
+			}
+			status, reason, quotaWindow := classifyCredentialProbeDetails(statusCode, body)
+			s.observeNormalQuotaFailure(account.ID, quotaWindow, reason, s.currentTime(), request.ExperimentalWeeklyOverdraft)
+			if credentialProbeResultIsDefinitive(reason) {
+				result.Status = status
+				result.ProbeKind = ModelProbeKindCredential
+				result.ReasonCode = reason
+				result.StatusCode = boundedHTTPStatus(statusCode)
+				result.QuotaWindow = quotaWindow
+				result.LatencyMS = maxInt64(0, s.currentTime().Sub(startedAt).Milliseconds())
+				result.Response = sanitizeModelTestResponsePreview(credentialResponse)
+				return result, nil
+			}
+		} else if errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
+			result.Status = "review"
+			result.ProbeKind = ModelProbeKindCredential
+			result.ReasonCode = "request_timeout"
+			result.LatencyMS = maxInt64(0, s.currentTime().Sub(startedAt).Milliseconds())
+			return result, nil
+		} else if errors.Is(probeCtx.Err(), context.Canceled) {
+			return ModelTestResult{}, probeCtx.Err()
+		}
+	}
+	if request.ExperimentalWeeklyOverdraft {
+		if s.experimentalTransformer == nil {
+			return ModelTestResult{}, fmt.Errorf("weekly overdraft experiment is unavailable")
+		}
+		modification, changed := s.experimentalTransformer.InterceptRequest(cpaapi.RequestInterceptRequest{
+			ToFormat: "codex",
+			Body:     []byte(probe.data),
+		})
+		callID := experimentalToolCallID(modification.Body)
+		if !changed || len(modification.Body) == 0 || callID == "" {
+			return ModelTestResult{}, fmt.Errorf("weekly overdraft experiment could not be applied")
+		}
+		probe.data = string(modification.Body)
+		result.Experiment = &ModelTestExperiment{Name: "weekly_overdraft", Applied: true, CallID: callID}
+	}
+
+	runAttempt := func(role, attemptModel string, attemptProbe modelProbe, experiment *ModelTestExperiment) (ModelTestAttempt, modelProbeHTTPResponse, error) {
+		attemptStartedAt := s.currentTime()
+		upstreamResponse, errCall := s.callAccountProbe(probeCtx, managementBaseURL, managementKey, callbackID, account, attemptProbe)
+		attempt := ModelTestAttempt{
+			Model: attemptModel, Role: role, ProbeKind: ModelProbeKindModel,
+			LatencyMS: maxInt64(0, s.currentTime().Sub(attemptStartedAt).Milliseconds()), TestedAt: attemptStartedAt,
+			Experiment: experiment,
+		}
+		if errCall != nil {
+			attempt.Status = "review"
+			if errors.Is(probeCtx.Err(), context.DeadlineExceeded) || errors.Is(errCall, context.DeadlineExceeded) {
+				attempt.ReasonCode = "request_timeout"
+			} else {
+				attempt.ReasonCode = "upstream_unavailable"
+			}
+			return attempt, upstreamResponse, errCall
+		}
+		attempt.Status, attempt.ReasonCode = classifyModelProbe(attemptProbe.kind, upstreamResponse.StatusCode, upstreamResponse.Body)
+		attempt.StatusCode = boundedHTTPStatus(upstreamResponse.StatusCode)
+		// HTTP 401 is account authentication evidence even when it was observed
+		// while calling a model endpoint. Other model failures remain model-scoped.
+		if attempt.StatusCode == http.StatusUnauthorized && attempt.ReasonCode == "authentication_failed" {
+			attempt.ProbeKind = ModelProbeKindCredential
+		}
+		attempt.Response = sanitizeModelTestResponsePreview(upstreamResponse)
+		return attempt, upstreamResponse, nil
+	}
+	applyAttempt := func(attempt ModelTestAttempt) {
+		result.Model = attempt.Model
+		result.Status = attempt.Status
+		result.ProbeKind = attempt.ProbeKind
+		result.ReasonCode = attempt.ReasonCode
+		result.StatusCode = attempt.StatusCode
+		result.QuotaWindow = attempt.QuotaWindow
+		result.Response = attempt.Response
+		result.Experiment = attempt.Experiment
+		result.LatencyMS = maxInt64(0, s.currentTime().Sub(startedAt).Milliseconds())
+		result.Attempts = append(result.Attempts, attempt)
+		if attempt.Status == "available" {
+			result.SelectedModel = attempt.Model
+		}
+		s.observeNormalQuotaFailure(account.ID, attempt.QuotaWindow, attempt.ReasonCode, s.currentTime(), request.ExperimentalWeeklyOverdraft)
+	}
+
+	primaryAttempt, primaryResponse, primaryErr := runAttempt("primary", selectedModel, probe, result.Experiment)
+	applyAttempt(primaryAttempt)
+	if primaryErr != nil || request.ExperimentalWeeklyOverdraft || !shouldFallbackCodexModel(probe, selectedModel, primaryResponse) {
+		return result, nil
+	}
+	fallbackProbe, fallbackModel, fallbackSupported, errFallback := buildModelProbe(probeProvider, defaultCodexFallbackModel, metadata)
+	if errFallback != nil {
+		return ModelTestResult{}, errFallback
+	}
+	if !fallbackSupported || !accountModelPolicyAllows(account.ModelPolicy, fallbackModel) {
+		return result, nil
+	}
+	result.FallbackModel = fallbackModel
+	fallbackAttempt, _, _ := runAttempt("fallback", fallbackModel, fallbackProbe, nil)
+	applyAttempt(fallbackAttempt)
+	result.FallbackUsed = fallbackAttempt.Status == "available"
+	if !request.DetectRestrictedModels || !result.FallbackUsed {
+		return result, nil
+	}
+	compatibilityProbe, compatibilityModel, compatibilitySupported, errCompatibility := buildModelProbe(probeProvider, codexCompatibilityMiniModel, metadata)
+	if errCompatibility != nil || !compatibilitySupported || !accountModelPolicyAllows(account.ModelPolicy, compatibilityModel) {
+		return result, nil
+	}
+	compatibilityAttempt, _, _ := runAttempt("compatibility", compatibilityModel, compatibilityProbe, nil)
+	result.Attempts = append(result.Attempts, compatibilityAttempt)
+	result.LatencyMS = maxInt64(0, s.currentTime().Sub(startedAt).Milliseconds())
+	result.CompatibleModels = []string{defaultCodexFallbackModel}
+	if compatibilityAttempt.Status == "available" {
+		result.CompatibleModels = []string{codexCompatibilityMiniModel, defaultCodexFallbackModel}
+	}
+	return result, nil
+}
+
+func (s *ModelTestService) observeNormalQuotaFailure(accountID, quotaWindow, reason string, testedAt time.Time, experimental bool) {
+	if s == nil || experimental || safeModelProbeReason(reason) != "quota_limited" || s.overdraft == nil {
+		return
+	}
+	gate, ok := s.experimentalTransformer.(requestInterceptionActivation)
+	if !ok || !gate.RequestInterceptionActive() {
+		return
+	}
+	s.overdraft.BeginOverdraftCycle(accountID, quotaWindow, testedAt)
+}
+
+func shouldFallbackCodexModel(probe modelProbe, model string, response modelProbeHTTPResponse) bool {
+	return probe.kind == "codex" && response.StatusCode == http.StatusBadRequest && model == defaultOpenAIProbeModel &&
+		unsupportedChatGPTAccountModel(response.Body) == model
+}
+
+func (s *ModelTestService) callAccountProbe(ctx context.Context, managementBaseURL, managementKey, callbackID string, account Account, probe modelProbe) (modelProbeHTTPResponse, error) {
+	provider := strings.ToLower(strings.TrimSpace(firstNonEmpty(account.Provider, account.Type)))
+	if provider != agentIdentityProvider {
+		return s.callManagementAPI(ctx, managementBaseURL, managementKey, account.ID, probe)
+	}
+	if s == nil || s.agentIdentity == nil || s.accounts == nil || s.accounts.host == nil {
+		return modelProbeHTTPResponse{}, fmt.Errorf("Agent Identity model-test executor is unavailable")
+	}
+	detail, errGet := s.accounts.host.GetAuth(ctx, account.ID)
+	if errGet != nil {
+		return modelProbeHTTPResponse{}, fmt.Errorf("load Agent Identity model-test credential: %w", errGet)
+	}
+	if len(detail.JSON) == 0 || len(detail.JSON) > agentIdentityMaxCredential {
+		return modelProbeHTTPResponse{}, fmt.Errorf("Agent Identity model-test credential size is invalid")
+	}
+	return s.agentIdentity.probeHTTP(ctx, callbackID, detail.JSON, probe)
+}
+
+func buildCodexCredentialProbe(metadata modelTestAuthMetadata) modelProbe {
+	headers := bearerJSONHeaders(false)
+	headers["Originator"] = "codex_cli_rs"
+	headers["User-Agent"] = "codex_cli_rs/0.1.0"
+	if metadata.accountID != "" {
+		headers["Chatgpt-Account-Id"] = metadata.accountID
+	}
+	return modelProbe{
+		kind: "credential", method: http.MethodGet,
+		url: "https://chatgpt.com/backend-api/wham/usage", headers: headers,
+	}
+}
+
+func (s *ModelTestService) authMetadata(ctx context.Context, authIndex string) modelTestAuthMetadata {
+	if s == nil || s.accounts == nil || s.accounts.host == nil {
+		return modelTestAuthMetadata{}
+	}
+	detail, errGet := s.accounts.host.GetAuth(ctx, authIndex)
+	if errGet != nil || len(detail.JSON) == 0 || len(detail.JSON) > 1<<20 {
+		return modelTestAuthMetadata{}
+	}
+	var raw map[string]any
+	if errDecode := json.Unmarshal(detail.JSON, &raw); errDecode != nil {
+		return modelTestAuthMetadata{}
+	}
+	records := modelTestCredentialRecords(raw)
+	metadata := modelTestAuthMetadata{
+		hasAPIKey:      modelTestRecordsHaveString(records, "api_key", "apiKey"),
+		hasAccessToken: modelTestRecordsHaveString(records, "access_token", "accessToken"),
+		accountID:      safeOperationIdentifier(modelTestResolveAccountID(records), 256),
+		baseURL:        safeProbeBaseURL(modelTestRecordsString(records, "base_url", "baseURL", "endpoint")),
+		projectID:      safeOperationIdentifier(modelTestRecordsString(records, "project_id", "projectId"), 256),
+		location:       safeOperationIdentifier(modelTestRecordsString(records, "location", "region"), 128),
+	}
+	return metadata
+}
+
+func (m modelTestAuthMetadata) usesAPIKey() bool {
+	return m.hasAPIKey && !m.hasAccessToken
+}
+
+func modelTestCredentialRecords(raw map[string]any) []map[string]any {
+	records := []map[string]any{raw}
+	for _, key := range []string{"metadata", "attributes", "credentials", "tokens"} {
+		if nested, ok := raw[key].(map[string]any); ok {
+			records = append(records, nested)
+		}
+	}
+	return records
+}
+
+func modelTestRecordsHaveString(records []map[string]any, keys ...string) bool {
+	return modelTestRecordsString(records, keys...) != ""
+}
+
+func modelTestRecordsString(records []map[string]any, keys ...string) string {
+	for _, record := range records {
+		for _, key := range keys {
+			if value := strings.TrimSpace(modelTestStringValue(record, key)); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func safeProbeBaseURL(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" || len(value) > 2048 || strings.ContainsAny(value, "\\r\\n") {
+		return ""
+	}
+	parsed, errParse := url.Parse(value)
+	if errParse != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return ""
+	}
+	return strings.TrimRight(value, "/")
+}
+
+func modelTestResolveAccountID(records []map[string]any) string {
+	for _, record := range records {
+		if accountID := modelTestAccountIDCandidate(record, 0); accountID != "" {
+			return accountID
+		}
+	}
+	for _, record := range records {
+		for _, key := range []string{"id_token", "idToken"} {
+			if accountID := modelTestAccountIDFromToken(record[key]); accountID != "" {
+				return accountID
+			}
+		}
+	}
+	return ""
+}
+
+func modelTestAccountIDCandidate(record map[string]any, depth int) string {
+	if record == nil || depth > 4 {
+		return ""
+	}
+	for _, key := range []string{"chatgpt_account_id", "chatgptAccountId", "account_id", "accountId"} {
+		switch value := record[key].(type) {
+		case string:
+			if candidate := strings.TrimSpace(value); candidate != "" {
+				return candidate
+			}
+		case map[string]any:
+			if candidate := modelTestAccountIDCandidate(value, depth+1); candidate != "" {
+				return candidate
+			}
+		}
+	}
+	for _, key := range []string{"metadata", "attributes", "credentials", "tokens", "https://api.openai.com/auth"} {
+		if nested, ok := record[key].(map[string]any); ok {
+			if candidate := modelTestAccountIDCandidate(nested, depth+1); candidate != "" {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
+func modelTestAccountIDFromToken(value any) string {
+	var payload map[string]any
+	switch typed := value.(type) {
+	case map[string]any:
+		payload = typed
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return ""
+		}
+		if errDecode := json.Unmarshal([]byte(trimmed), &payload); errDecode != nil {
+			segments := strings.Split(trimmed, ".")
+			if len(segments) < 2 {
+				return ""
+			}
+			decoded, errBase64 := base64.RawURLEncoding.DecodeString(segments[1])
+			if errBase64 != nil || json.Unmarshal(decoded, &payload) != nil {
+				return ""
+			}
+		}
+	default:
+		return ""
+	}
+	return modelTestAccountIDCandidate(payload, 0)
+}
+
+func buildModelProbe(provider, requestedModel string, metadata modelTestAuthMetadata) (modelProbe, string, bool, error) {
+	model := safeModelIdentifier(requestedModel)
+	marshal := func(payload any) (string, error) {
+		raw, errMarshal := json.Marshal(payload)
+		if errMarshal != nil {
+			return "", fmt.Errorf("encode model-test payload: %w", errMarshal)
+		}
+		return string(raw), nil
+	}
+	switch provider {
+	case "codex":
+		if model == "" {
+			model = defaultOpenAIProbeModel
+		}
+		if metadata.usesAPIKey() {
+			data, errMarshal := marshal(openAIResponsesProbePayload(model, false))
+			return modelProbe{kind: "openai", url: "https://api.openai.com/v1/responses", headers: bearerJSONHeaders(false), data: data}, model, true, errMarshal
+		}
+		data, errMarshal := marshal(openAIResponsesProbePayload(model, true))
+		headers := bearerJSONHeaders(true)
+		headers["OpenAI-Beta"] = "responses=experimental"
+		headers["Originator"] = "codex_cli_rs"
+		headers["User-Agent"] = "codex_cli_rs/0.1.0"
+		if metadata.accountID != "" {
+			headers["Chatgpt-Account-Id"] = metadata.accountID
+		}
+		return modelProbe{kind: "codex", url: "https://chatgpt.com/backend-api/codex/responses", headers: headers, data: data}, model, true, errMarshal
+	case "openai":
+		if model == "" {
+			model = defaultOpenAIProbeModel
+		}
+		data, errMarshal := marshal(openAIResponsesProbePayload(model, false))
+		return modelProbe{kind: "openai", url: "https://api.openai.com/v1/responses", headers: bearerJSONHeaders(false), data: data}, model, true, errMarshal
+	case "claude", "anthropic":
+		if model == "" {
+			model = "claude-sonnet-4-5-20250929"
+		}
+		data, errMarshal := marshal(map[string]any{"model": model, "max_tokens": 1, "messages": []map[string]string{{"role": "user", "content": "hi"}}})
+		headers := map[string]string{"Content-Type": "application/json", "Accept": "application/json", "anthropic-version": "2023-06-01"}
+		if metadata.usesAPIKey() {
+			headers["x-api-key"] = "$TOKEN$"
+		} else {
+			headers["Authorization"] = "Bearer $TOKEN$"
+			headers["anthropic-beta"] = "oauth-2025-04-20"
+		}
+		return modelProbe{kind: "claude", url: "https://api.anthropic.com/v1/messages", headers: headers, data: data}, model, true, errMarshal
+	case "kimi":
+		if model == "" {
+			model = "kimi-k2.6"
+		}
+		data, errMarshal := marshal(map[string]any{
+			"model":      model,
+			"messages":   []map[string]string{{"role": "user", "content": "hi"}},
+			"max_tokens": 1,
+			"stream":     false,
+		})
+		return modelProbe{kind: "kimi", url: "https://api.kimi.com/coding/v1/chat/completions", headers: bearerJSONHeaders(false), data: data}, model, true, errMarshal
+	case "gemini", "gemini-cli", "gemini-interactions", "aistudio":
+		if model == "" {
+			model = "gemini-2.0-flash"
+		}
+		geminiModel := strings.TrimPrefix(model, "models/")
+		data, errMarshal := marshal(map[string]any{
+			"contents":         []map[string]any{{"role": "user", "parts": []map[string]string{{"text": "hi"}}}},
+			"generationConfig": map[string]int{"maxOutputTokens": 1},
+		})
+		headers := map[string]string{"Content-Type": "application/json", "Accept": "application/json"}
+		if metadata.usesAPIKey() || provider == "aistudio" {
+			headers["x-goog-api-key"] = "$TOKEN$"
+		} else {
+			headers["Authorization"] = "Bearer $TOKEN$"
+		}
+		probeURL := "https://generativelanguage.googleapis.com/v1beta/models/" + url.PathEscape(geminiModel) + ":generateContent"
+		return modelProbe{kind: "gemini", url: probeURL, headers: headers, data: data}, model, true, errMarshal
+	case "vertex":
+		if model == "" {
+			model = "gemini-2.0-flash"
+		}
+		if metadata.projectID == "" {
+			return modelProbe{}, model, false, fmt.Errorf("Vertex provider has no project_id")
+		}
+		location := metadata.location
+		if location == "" {
+			location = "us-central1"
+		}
+		data, errMarshal := marshal(map[string]any{
+			"contents":         []map[string]any{{"role": "user", "parts": []map[string]string{{"text": "hi"}}}},
+			"generationConfig": map[string]int{"maxOutputTokens": 1},
+		})
+		headers := map[string]string{"Content-Type": "application/json", "Accept": "application/json"}
+		if metadata.usesAPIKey() {
+			headers["x-goog-api-key"] = "$TOKEN$"
+		} else {
+			headers["Authorization"] = "Bearer $TOKEN$"
+		}
+		probeURL := "https://" + url.PathEscape(location) + "-aiplatform.googleapis.com/v1/projects/" + url.PathEscape(metadata.projectID) + "/locations/" + url.PathEscape(location) + "/publishers/google/models/" + url.PathEscape(model) + ":generateContent"
+		return modelProbe{kind: "gemini", url: probeURL, headers: headers, data: data}, model, true, errMarshal
+	case "xai", "grok":
+		if model == "" {
+			model = "grok-4"
+		}
+		data, errMarshal := marshal(openAIResponsesProbePayload(model, false))
+		return modelProbe{kind: "openai", url: "https://api.x.ai/v1/responses", headers: bearerJSONHeaders(false), data: data}, model, true, errMarshal
+	case "antigravity":
+		if model == "" {
+			model = "gemini-3.6-flash"
+		}
+		data, errMarshal := marshal(map[string]any{
+			"project": metadata.projectID,
+			"model":   model,
+			"request": map[string]any{
+				"contents":         []map[string]any{{"role": "user", "parts": []map[string]string{{"text": "hi"}}}},
+				"generationConfig": map[string]int{"maxOutputTokens": 1},
+			},
+		})
+		return modelProbe{kind: "gemini", url: "https://cloudcode-pa.googleapis.com/v1internal:generateContent", headers: bearerJSONHeaders(false), data: data}, model, metadata.projectID != "", errMarshal
+	case "openai-compatible", "openai-compatibility":
+		if model == "" {
+			model = "gpt-4o-mini"
+		}
+		if metadata.baseURL == "" {
+			return modelProbe{}, model, false, fmt.Errorf("OpenAI-compatible provider has no valid base_url")
+		}
+		data, errMarshal := marshal(map[string]any{"model": model, "messages": []map[string]string{{"role": "user", "content": "hi"}}, "max_tokens": 1, "stream": false})
+		return modelProbe{kind: "openai-chat", url: openAICompatibleChatURL(metadata.baseURL), headers: bearerJSONHeaders(false), data: data}, model, true, errMarshal
+	default:
+		if strings.HasPrefix(provider, "openai-compatible-") || strings.HasPrefix(provider, "openai-compatibility-") {
+			return buildModelProbe("openai-compatible", requestedModel, metadata)
+		}
+		return modelProbe{}, model, false, nil
+	}
+}
+
+func openAICompatibleChatURL(base string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(base), "/")
+	if strings.HasSuffix(trimmed, "/chat/completions") {
+		return trimmed
+	}
+	if strings.HasSuffix(trimmed, "/v1") {
+		return trimmed + "/chat/completions"
+	}
+	return trimmed + "/v1/chat/completions"
+}
+
+func openAIResponsesProbePayload(model string, streaming bool) map[string]any {
+	payload := map[string]any{
+		"model":        model,
+		"input":        []map[string]any{{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "hi"}}}},
+		"instructions": "Reply with OK only.",
+		"stream":       streaming,
+	}
+	if streaming {
+		payload["store"] = false
+	} else {
+		payload["max_output_tokens"] = 16
+	}
+	return payload
+}
+
+func experimentalToolCallID(body []byte) string {
+	if len(body) == 0 || len(body) > defaultExperimentalRequestBodyLimit {
+		return ""
+	}
+	var document struct {
+		Input []struct {
+			Type   string `json:"type"`
+			CallID string `json:"call_id"`
+		} `json:"input"`
+	}
+	if errDecode := json.Unmarshal(body, &document); errDecode != nil || len(document.Input) < 2 {
+		return ""
+	}
+	call := document.Input[len(document.Input)-2]
+	output := document.Input[len(document.Input)-1]
+	callID := safeOperationIdentifier(call.CallID, 128)
+	if call.Type != "custom_tool_call" || output.Type != "custom_tool_call_output" || callID == "" || callID != output.CallID {
+		return ""
+	}
+	return callID
+}
+
+func bearerJSONHeaders(streaming bool) map[string]string {
+	accept := "application/json"
+	if streaming {
+		accept = "text/event-stream"
+	}
+	return map[string]string{
+		"Accept":        accept,
+		"Authorization": "Bearer $TOKEN$",
+		"Content-Type":  "application/json",
+	}
+}
+
+func (s *ModelTestService) callManagementAPI(ctx context.Context, managementBaseURL, managementKey, authIndex string, probe modelProbe) (modelProbeHTTPResponse, error) {
+	baseURL, errBaseURL := validateManagementBaseURL(managementBaseURL)
+	if errBaseURL != nil {
+		return modelProbeHTTPResponse{}, errBaseURL
+	}
+	managementKey = strings.TrimSpace(managementKey)
+	if managementKey == "" {
+		return modelProbeHTTPResponse{}, fmt.Errorf("management key is unavailable")
+	}
+	payload, errMarshal := json.Marshal(managementAPICallRequest{
+		AuthIndex: authIndex,
+		Method:    firstNonEmpty(probe.method, http.MethodPost),
+		URL:       probe.url,
+		Header:    probe.headers,
+		Data:      probe.data,
+	})
+	if errMarshal != nil {
+		return modelProbeHTTPResponse{}, fmt.Errorf("encode management model-test request: %w", errMarshal)
+	}
+	request, errRequest := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v0/management/api-call", bytes.NewReader(payload))
+	if errRequest != nil {
+		return modelProbeHTTPResponse{}, fmt.Errorf("create management model-test request: %w", errRequest)
+	}
+	request.Header.Set("Authorization", "Bearer "+managementKey)
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/json")
+	managementKey = ""
+	doer := s.doer
+	if doer == nil {
+		doer = &http.Client{Timeout: modelTestTimeout + 2*time.Second}
+	}
+	response, errDo := doer.Do(request)
+	if errDo != nil {
+		return modelProbeHTTPResponse{}, fmt.Errorf("management model-test request failed: %w", errDo)
+	}
+	defer func() { _ = response.Body.Close() }()
+	outerBody, errRead := io.ReadAll(io.LimitReader(response.Body, maxModelTestResponseBytes+1))
+	if errRead != nil {
+		return modelProbeHTTPResponse{}, fmt.Errorf("read management model-test response: %w", errRead)
+	}
+	if len(outerBody) > maxModelTestResponseBytes {
+		return modelProbeHTTPResponse{}, fmt.Errorf("management model-test response exceeded the size limit")
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return modelProbeHTTPResponse{}, fmt.Errorf("management model-test request returned HTTP %d", response.StatusCode)
+	}
+	var decoded managementAPICallResponse
+	if errDecode := json.Unmarshal(outerBody, &decoded); errDecode != nil {
+		return modelProbeHTTPResponse{}, fmt.Errorf("decode management model-test response: %w", errDecode)
+	}
+	if len(decoded.Body) > maxModelTestBodyBytes {
+		return modelProbeHTTPResponse{}, fmt.Errorf("upstream model-test response exceeded the size limit")
+	}
+	return modelProbeHTTPResponse{
+		StatusCode: decoded.StatusCode,
+		Header:     decoded.Header,
+		Body:       []byte(string(decoded.Body)),
+	}, nil
+}
+
+func classifyCredentialProbe(statusCode int, body []byte) (string, string) {
+	status, reason, _ := classifyCredentialProbeDetails(statusCode, body)
+	return status, reason
+}
+
+func classifyCredentialProbeDetails(statusCode int, body []byte) (string, string, string) {
+	lower := bytes.ToLower(bytes.TrimSpace(body))
+	switch statusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		if bytes.Contains(lower, []byte("account_deactivated")) {
+			return "unavailable", "account_deactivated", ""
+		}
+		return "unavailable", "authentication_failed", ""
+	case http.StatusPaymentRequired:
+		if bytes.Contains(lower, []byte("deactivated_workspace")) {
+			return "unavailable", "workspace_deactivated", ""
+		}
+		if bytes.Contains(lower, []byte("account_deactivated")) {
+			return "unavailable", "account_deactivated", ""
+		}
+		return "review", "quota_limited", QuotaWindowMultiple
+	case http.StatusTooManyRequests:
+		if modelProbeBodyHasQuotaEvidence(body) {
+			return "review", "quota_limited", QuotaWindowMultiple
+		}
+		return "review", "transient_failure", ""
+	default:
+		if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
+			valid, limited, quotaWindow := codexUsageProbeState(body)
+			if !valid {
+				return "review", "invalid_response", ""
+			}
+			if limited {
+				return "review", "quota_limited", quotaWindow
+			}
+			return "available", "credential_response_ok", ""
+		}
+		if statusCode == http.StatusRequestTimeout || statusCode == http.StatusGatewayTimeout {
+			return "review", "request_timeout", ""
+		}
+		if statusCode >= http.StatusInternalServerError {
+			return "review", "upstream_unavailable", ""
+		}
+		return "review", "invalid_response", ""
+	}
+}
+
+func codexUsageProbeQuotaLimited(body []byte) bool {
+	_, limited, _ := codexUsageProbeState(body)
+	return limited
+}
+
+func codexUsageProbeState(body []byte) (bool, bool, string) {
+	var payload codexUsageProbeEnvelope
+	if errDecode := json.Unmarshal(bytes.TrimSpace(body), &payload); errDecode != nil {
+		return false, false, ""
+	}
+	limit := payload.RateLimit
+	if limit == nil {
+		limit = payload.RateLimitCamel
+	}
+	if limit == nil {
+		return false, false, ""
+	}
+	valid := limit.Allowed != nil || limit.LimitReached != nil || limit.LimitReachedCamel != nil
+	topLevelLimited := (limit.LimitReached != nil && *limit.LimitReached) ||
+		(limit.LimitReachedCamel != nil && *limit.LimitReachedCamel) ||
+		(limit.Allowed != nil && !*limit.Allowed)
+	type probeWindow struct {
+		window   *codexUsageProbeWindow
+		fallback string
+	}
+	fiveHourLimited := false
+	longLimited := false
+	windowObserved := false
+	for _, candidate := range []probeWindow{
+		{limit.PrimaryWindow, QuotaWindowFiveHour},
+		{limit.PrimaryWindowCamel, QuotaWindowFiveHour},
+		{limit.SecondaryWindow, QuotaWindowSevenDay},
+		{limit.SecondaryWindowCamel, QuotaWindowSevenDay},
+	} {
+		window := candidate.window
+		if window == nil {
+			continue
+		}
+		usedPercent := window.UsedPercent
+		if usedPercent == nil {
+			usedPercent = window.UsedPercentCamel
+		}
+		if usedPercent == nil {
+			continue
+		}
+		valid = true
+		windowObserved = true
+		if *usedPercent < 100 {
+			continue
+		}
+		windowKind := candidate.fallback
+		seconds := window.LimitWindowSeconds
+		if seconds == nil {
+			seconds = window.LimitWindowSecondsCamel
+		}
+		if seconds != nil {
+			if *seconds <= 24*60*60 {
+				windowKind = QuotaWindowFiveHour
+			} else {
+				windowKind = QuotaWindowSevenDay
+			}
+		}
+		if windowKind == QuotaWindowFiveHour {
+			fiveHourLimited = true
+		} else {
+			longLimited = true
+		}
+	}
+	if fiveHourLimited && longLimited {
+		return valid, true, QuotaWindowMultiple
+	}
+	if longLimited {
+		return valid, true, QuotaWindowSevenDay
+	}
+	if fiveHourLimited {
+		return valid, true, QuotaWindowFiveHour
+	}
+	// Window percentages are more specific than the aggregate allowed flag.
+	// A five-hour cooldown can set allowed=false while the long window remains
+	// healthy, which must not disable an otherwise recoverable account.
+	if windowObserved {
+		return true, false, ""
+	}
+	if topLevelLimited {
+		return true, true, QuotaWindowMultiple
+	}
+	return valid, false, ""
+}
+
+func codexUsageProbeSnapshot(body []byte, now time.Time) *CodexUsageSnapshot {
+	var payload codexUsageProbeEnvelope
+	if errDecode := json.Unmarshal(bytes.TrimSpace(body), &payload); errDecode != nil {
+		return nil
+	}
+	limit := payload.RateLimit
+	if limit == nil {
+		limit = payload.RateLimitCamel
+	}
+	if limit == nil {
+		return nil
+	}
+	snapshot := &CodexUsageSnapshot{ObservedAt: now.UTC()}
+	for _, candidate := range []struct {
+		window   *codexUsageProbeWindow
+		fallback string
+	}{
+		{limit.PrimaryWindow, QuotaWindowFiveHour},
+		{limit.PrimaryWindowCamel, QuotaWindowFiveHour},
+		{limit.SecondaryWindow, QuotaWindowSevenDay},
+		{limit.SecondaryWindowCamel, QuotaWindowSevenDay},
+	} {
+		window, kind := usageWindowFromCredentialProbe(candidate.window, candidate.fallback, now)
+		if window == nil {
+			continue
+		}
+		if kind == QuotaWindowFiveHour {
+			snapshot.FiveHour = window
+		} else {
+			snapshot.SevenDay = window
+		}
+	}
+	if snapshot.FiveHour == nil && snapshot.SevenDay == nil {
+		return nil
+	}
+	return snapshot
+}
+
+func usageWindowFromCredentialProbe(raw *codexUsageProbeWindow, fallback string, now time.Time) (*UsageWindowSnapshot, string) {
+	if raw == nil {
+		return nil, ""
+	}
+	usedPercent := raw.UsedPercent
+	if usedPercent == nil {
+		usedPercent = raw.UsedPercentCamel
+	}
+	if usedPercent == nil || math.IsNaN(*usedPercent) || math.IsInf(*usedPercent, 0) || *usedPercent < 0 || *usedPercent > 10_000 {
+		return nil, ""
+	}
+	window := &UsageWindowSnapshot{UsedPercent: *usedPercent}
+	kind := fallback
+	seconds := raw.LimitWindowSeconds
+	if seconds == nil {
+		seconds = raw.LimitWindowSecondsCamel
+	}
+	if seconds != nil && !math.IsNaN(*seconds) && !math.IsInf(*seconds, 0) && *seconds > 0 && *seconds <= maxUsageWindowMinutes*60 {
+		window.WindowMinutes = int(math.Round(*seconds / 60))
+		if *seconds <= 24*60*60 {
+			kind = QuotaWindowFiveHour
+		} else {
+			kind = QuotaWindowSevenDay
+		}
+	}
+	resetAfter := raw.ResetAfterSeconds
+	if resetAfter == nil {
+		resetAfter = raw.ResetAfterSecondsCamel
+	}
+	if resetAfter != nil && !math.IsNaN(*resetAfter) && !math.IsInf(*resetAfter, 0) && *resetAfter >= 0 && *resetAfter <= maxUsageResetAfter.Seconds() {
+		resetAt := now.Add(time.Duration(*resetAfter * float64(time.Second))).UTC()
+		window.ResetAt = &resetAt
+	} else {
+		resetAtSeconds := raw.ResetAt
+		if resetAtSeconds == nil {
+			resetAtSeconds = raw.ResetAtCamel
+		}
+		if resetAtSeconds != nil && !math.IsNaN(*resetAtSeconds) && !math.IsInf(*resetAtSeconds, 0) {
+			resetAt := time.Unix(int64(*resetAtSeconds), 0).UTC()
+			if !resetAt.Before(now.Add(-time.Minute)) && !resetAt.After(now.Add(maxUsageResetAfter)) {
+				window.ResetAt = &resetAt
+			}
+		}
+	}
+	return window, kind
+}
+
+func credentialProbeResultIsDefinitive(reason string) bool {
+	switch safeModelProbeReason(reason) {
+	case "authentication_failed", "workspace_deactivated", "account_deactivated", "quota_limited":
+		return true
+	default:
+		return false
+	}
+}
+
+func classifyModelProbe(kind string, statusCode int, body []byte) (string, string) {
+	if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
+		if validModelProbeBody(kind, body) {
+			return "available", "model_response_ok"
+		}
+		if bodyIndicatesMissingModel(body) {
+			return "unavailable", "model_not_found"
+		}
+		return "review", "invalid_response"
+	}
+	switch statusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return "unavailable", "authentication_failed"
+	case http.StatusTooManyRequests:
+		if modelProbeBodyHasQuotaEvidence(body) {
+			return "review", "quota_limited"
+		}
+		return "review", "transient_failure"
+	case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+		return "review", "request_timeout"
+	case http.StatusBadRequest, http.StatusNotFound:
+		if unsupportedChatGPTAccountModel(body) != "" || bodyIndicatesMissingModel(body) {
+			return "unavailable", "model_not_found"
+		}
+		return "review", "invalid_response"
+	default:
+		if statusCode >= http.StatusInternalServerError {
+			return "review", "upstream_unavailable"
+		}
+		return "review", "invalid_response"
+	}
+}
+
+func modelProbeBodyHasQuotaEvidence(body []byte) bool {
+	text := normalizedFailureText(string(body))
+	return containsModelProbeText(text, "usage_limit_reached", "usage limit has been reached", "quota exhausted", "weekly limit reached")
+}
+
+func containsModelProbeText(text string, values ...string) bool {
+	text = strings.ToLower(text)
+	for _, value := range values {
+		if strings.Contains(text, strings.ToLower(value)) {
+			return true
+		}
+	}
+	return false
+}
+
+func unsupportedChatGPTAccountModel(body []byte) string {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || len(trimmed) > maxModelTestBodyBytes {
+		return ""
+	}
+	var payload struct {
+		Detail string `json:"detail"`
+	}
+	if errDecode := json.Unmarshal(trimmed, &payload); errDecode != nil {
+		return ""
+	}
+	const prefix = "The '"
+	const suffix = "' model is not supported when using Codex with a ChatGPT account."
+	if !strings.HasPrefix(payload.Detail, prefix) || !strings.HasSuffix(payload.Detail, suffix) {
+		return ""
+	}
+	model := strings.TrimSuffix(strings.TrimPrefix(payload.Detail, prefix), suffix)
+	if safeModelIdentifier(model) == "" || payload.Detail != prefix+model+suffix {
+		return ""
+	}
+	return model
+}
+
+func validModelProbeBody(kind string, body []byte) bool {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || len(trimmed) > maxModelTestBodyBytes {
+		return false
+	}
+	lower := bytes.ToLower(trimmed)
+	if bytes.Contains(lower, []byte(`"type":"error"`)) || bytes.Contains(lower, []byte(`"type": "error"`)) ||
+		bytes.Contains(lower, []byte(`"response.failed"`)) {
+		return false
+	}
+	if kind == "codex" {
+		return bytes.Contains(lower, []byte(`"response.completed"`)) || bytes.Contains(lower, []byte(`"response.output_item.done"`))
+	}
+	var decoded map[string]any
+	if errDecode := json.Unmarshal(trimmed, &decoded); errDecode != nil {
+		return false
+	}
+	if _, hasError := decoded["error"]; hasError {
+		return false
+	}
+	switch kind {
+	case "kimi", "openai-chat":
+		choices, ok := decoded["choices"].([]any)
+		return ok && len(choices) > 0
+	case "claude":
+		return strings.TrimSpace(modelTestStringValue(decoded, "id")) != "" && strings.EqualFold(modelTestStringValue(decoded, "type"), "message")
+	case "gemini":
+		candidates, ok := decoded["candidates"].([]any)
+		return ok && len(candidates) > 0
+	default:
+		id := strings.TrimSpace(modelTestStringValue(decoded, "id"))
+		object := strings.ToLower(strings.TrimSpace(modelTestStringValue(decoded, "object")))
+		return id != "" && (object == "response" || strings.Contains(object, "completion"))
+	}
+}
+
+func bodyIndicatesMissingModel(body []byte) bool {
+	lower := strings.ToLower(string(bytes.TrimSpace(body)))
+	if !strings.Contains(lower, "model") {
+		return false
+	}
+	for _, marker := range []string{"not found", "does not exist", "unsupported", "unknown model", "invalid model", "not available"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func safeModelIdentifier(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len([]rune(value)) > maxModelIdentifierLength || strings.Contains(value, "://") {
+		return ""
+	}
+	for _, character := range value {
+		if unicode.IsLetter(character) || unicode.IsDigit(character) || strings.ContainsRune("-._:/@", character) {
+			continue
+		}
+		return ""
+	}
+	return value
+}
+
+func modelTestStringValue(values map[string]any, key string) string {
+	value, ok := values[key].(string)
+	if !ok {
+		return ""
+	}
+	return value
+}
+
+func accountTypeUsesAPIKey(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "api_key", "api-key", "apikey":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *ModelTestService) currentTime() time.Time {
+	now := time.Now
+	if s != nil && s.now != nil {
+		now = s.now
+	}
+	return now().UTC()
+}
+
+func maxInt64(left, right int64) int64 {
+	if left > right {
+		return left
+	}
+	return right
+}

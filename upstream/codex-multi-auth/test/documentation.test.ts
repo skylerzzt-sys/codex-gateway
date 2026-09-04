@@ -1,0 +1,996 @@
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { beforeAll, describe, expect, it, vi } from "vitest";
+import { UI_COPY } from "../lib/ui/ui-copy.js";
+import { DEFAULT_MODEL } from "../lib/request/helpers/model-map.js";
+
+const projectRoot = resolve(process.cwd());
+
+function readPackageVersion(): string {
+	const packagePath = join(projectRoot, "package.json");
+	let parsed: { version?: unknown };
+	try {
+		parsed = JSON.parse(readFileSync(packagePath, "utf-8")) as {
+			version?: unknown;
+		};
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		throw new Error(`Failed to read ${packagePath}: ${message}`);
+	}
+	if (
+		typeof parsed.version !== "string" ||
+		parsed.version.trim().length === 0
+	) {
+		throw new Error("package.json must define a non-empty version string");
+	}
+	return parsed.version.trim();
+}
+
+let packageVersion = "";
+let currentStableReleaseDoc = "";
+// Keep previous/earlier pins on recent stables so README + portal narrative stay current.
+const previousStableReleaseDoc = "docs/releases/v2.6.0.md";
+const earlierStableReleaseDoc = "docs/releases/v2.5.0.md";
+const stableArchiveReleaseDocs = [
+	"docs/releases/v2.4.0.md",
+	"docs/releases/v2.3.3.md",
+	"docs/releases/v2.1.2.md",
+	"docs/releases/v2.1.1.md",
+	"docs/releases/v2.1.0.md",
+	"docs/releases/v2.0.2.md",
+	"docs/releases/v2.0.1.md",
+	"docs/releases/v2.0.0.md",
+	"docs/releases/v1.3.2.md",
+	"docs/releases/v1.3.1.md",
+	"docs/releases/v1.3.0.md",
+	"docs/releases/v1.2.7.md",
+	"docs/releases/v1.2.6.md",
+	"docs/releases/v1.2.5.md",
+	"docs/releases/v1.2.4.md",
+	"docs/releases/v1.2.2.md",
+	"docs/releases/v1.2.1.md",
+	"docs/releases/v1.2.0.md",
+];
+const preOneArchiveReleaseDocs = [
+	"docs/releases/v0.1.7.md",
+	"docs/releases/v0.1.6.md",
+	"docs/releases/v0.1.5.md",
+];
+
+function getUserDocs(): string[] {
+	return [
+		"docs/index.md",
+		"docs/README.md",
+		"docs/getting-started.md",
+		"docs/faq.md",
+		"docs/architecture.md",
+		"docs/features.md",
+		"docs/configuration.md",
+		"docs/troubleshooting.md",
+		"docs/privacy.md",
+		"docs/upgrade.md",
+		"docs/reference/commands.md",
+		"docs/reference/public-api.md",
+		"docs/reference/error-contracts.md",
+		"docs/reference/settings.md",
+		"docs/reference/storage-paths.md",
+		currentStableReleaseDoc,
+		previousStableReleaseDoc,
+		earlierStableReleaseDoc,
+		...stableArchiveReleaseDocs,
+		...preOneArchiveReleaseDocs,
+		"docs/releases/v0.1.4.md",
+		"docs/releases/v0.1.3.md",
+		"docs/releases/v0.1.1.md",
+		"docs/releases/v0.1.0.md",
+		"docs/releases/v0.1.0-beta.0.md",
+		"docs/releases/legacy-pre-0.1-history.md",
+	];
+}
+
+const scopedLegacyAllowedFiles = new Set([
+	"README.md",
+	"docs/getting-started.md",
+	"docs/troubleshooting.md",
+	"docs/upgrade.md",
+	"docs/releases/v0.1.0.md",
+	"docs/releases/v0.1.0-beta.0.md",
+]);
+
+const compatibilityAliasAllowedFiles = new Set([
+	"docs/reference/commands.md",
+	"docs/troubleshooting.md",
+	"docs/upgrade.md",
+]);
+
+const maintainerRunbooks = [
+	"docs/development/RUNBOOK_ADD_AUTH_COMMAND.md",
+	"docs/development/RUNBOOK_ADD_CONFIG_FIELD.md",
+	"docs/development/RUNBOOK_CHANGE_ROUTING_POLICY.md",
+];
+
+beforeAll(() => {
+	packageVersion = readPackageVersion();
+	currentStableReleaseDoc = `docs/releases/v${packageVersion}.md`;
+});
+
+function read(filePath: string): string {
+	return readFileSync(join(projectRoot, filePath), "utf-8");
+}
+
+function extractInternalLinks(markdown: string): string[] {
+	return [...markdown.matchAll(/\[[^\]]+\]\(([^)]+)\)/g)]
+		.map((match) => match[1])
+		.filter((link) => !link.startsWith("http") && !link.startsWith("#"));
+}
+
+function listMarkdownFiles(rootDir: string): string[] {
+	const entries = readdirSync(rootDir, { withFileTypes: true }).sort(
+		(left, right) => left.name.localeCompare(right.name),
+	);
+	const markdownFiles: string[] = [];
+	for (const entry of entries) {
+		const absolutePath = join(rootDir, entry.name);
+		if (entry.isDirectory()) {
+			markdownFiles.push(...listMarkdownFiles(absolutePath));
+			continue;
+		}
+		if (entry.isFile() && entry.name.toLowerCase().endsWith(".md")) {
+			markdownFiles.push(absolutePath);
+		}
+	}
+	return markdownFiles.sort((left, right) => left.localeCompare(right));
+}
+
+function listSourceFiles(rootDir: string): string[] {
+	let entries: ReturnType<typeof readdirSync>;
+	try {
+		entries = readdirSync(rootDir, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+	const sourceFiles: string[] = [];
+	for (const entry of entries) {
+		const absolutePath = join(rootDir, entry.name);
+		if (entry.isDirectory()) {
+			sourceFiles.push(...listSourceFiles(absolutePath));
+			continue;
+		}
+		if (entry.isFile() && /\.(ts|js|mjs)$/.test(entry.name)) {
+			sourceFiles.push(absolutePath);
+		}
+	}
+	return sourceFiles;
+}
+
+let cachedSourceBlob: string | null = null;
+
+/**
+ * All shipped source concatenated, for presence checks on env-var names.
+ *
+ * Deliberately a substring search rather than a pattern over access forms.
+ * This codebase reads env through at least three shapes — `process.env.NAME`,
+ * a string literal handed to a resolver that does `process.env[envName]`
+ * (`resolveBooleanSetting("CODEX_MODE", …)`), and `env.NAME` off a passed-in
+ * env object. Enumerating those forms is what makes this check wrong: each
+ * omission reports live variables as deleted. The question worth asking is
+ * simply "does this name appear in shipped code at all", so ask that.
+ */
+function readSourceBlob(): string {
+	if (cachedSourceBlob !== null) return cachedSourceBlob;
+	const files = [
+		...listSourceFiles(join(projectRoot, "lib")),
+		...listSourceFiles(join(projectRoot, "scripts")),
+		join(projectRoot, "index.ts"),
+	];
+	const parts: string[] = [];
+	for (const filePath of files) {
+		try {
+			parts.push(readFileSync(filePath, "utf-8"));
+		} catch {
+			// Unreadable file cannot disprove a name; skip it.
+		}
+	}
+	cachedSourceBlob = parts.join("\n");
+	return cachedSourceBlob;
+}
+
+function isExternalOrUriSchemeLink(linkPath: string): boolean {
+	return /^[a-z][a-z0-9+.-]*:/i.test(linkPath) || linkPath.startsWith("//");
+}
+
+function compareSemverDescending(left: string, right: string): number {
+	const leftParts = left.split(".").map((part) => Number.parseInt(part, 10));
+	const rightParts = right.split(".").map((part) => Number.parseInt(part, 10));
+	for (let index = 0; index < 3; index += 1) {
+		const leftPart = leftParts[index] ?? 0;
+		const rightPart = rightParts[index] ?? 0;
+		if (leftPart !== rightPart) {
+			return leftPart - rightPart;
+		}
+	}
+	return 0;
+}
+
+describe("Documentation Integrity", () => {
+	it("has all required user docs and release notes", () => {
+		for (const docPath of getUserDocs()) {
+			const fullPath = join(projectRoot, docPath);
+			expect(existsSync(fullPath), `${docPath} should exist`).toBe(true);
+			expect(
+				read(docPath).trim().length,
+				`${docPath} should not be empty`,
+			).toBeGreaterThan(0);
+		}
+	});
+
+	it("docs portal and root README link to stable, beta, and archived release history", () => {
+		const portal = read("docs/README.md");
+		const readme = read("README.md");
+		expect(portal).toContain("reference/public-api.md");
+		expect(portal).toContain("reference/error-contracts.md");
+		expect(portal).toContain(`releases/v${packageVersion}.md`);
+		expect(portal).toContain(previousStableReleaseDoc.replace("docs/", ""));
+		expect(portal).toContain(earlierStableReleaseDoc.replace("docs/", ""));
+		for (const archivedDoc of stableArchiveReleaseDocs) {
+			expect(portal).toContain(archivedDoc.replace("docs/", ""));
+		}
+		for (const archivedDoc of preOneArchiveReleaseDocs) {
+			expect(portal).toContain(archivedDoc.replace("docs/", ""));
+		}
+		expect(portal).toContain("releases/v0.1.0-beta.0.md");
+		expect(portal).toContain("releases/legacy-pre-0.1-history.md");
+		expect(portal).toContain(
+			"| [Release history](#release-history) | Stable, previous, and archived release notes |",
+		);
+		expect(readme).toContain(currentStableReleaseDoc);
+		expect(readme).toContain(previousStableReleaseDoc);
+		expect(readme).toContain(earlierStableReleaseDoc);
+		expect(readme).toContain("docs/README.md#release-history");
+
+		const beta = read("docs/releases/v0.1.0-beta.0.md");
+		expect(beta).toContain("Archived");
+		expect(beta).toContain("superseded by [v0.1.0]");
+	});
+
+	it("docs portal links every release note under docs/releases", () => {
+		const portal = read("docs/README.md");
+		const releaseDir = join(projectRoot, "docs/releases");
+		const releaseFiles = readdirSync(releaseDir)
+			.filter((name) => name.toLowerCase().endsWith(".md"))
+			.sort((left, right) => left.localeCompare(right));
+		expect(releaseFiles.length).toBeGreaterThan(0);
+		for (const name of releaseFiles) {
+			expect(
+				portal,
+				`docs/README.md should link releases/${name}`,
+			).toContain(`releases/${name}`);
+		}
+	});
+
+	it("documents mcodex, login --org, and budget flag names that match the CLI", () => {
+		const commands = read("docs/reference/commands.md");
+		const help = read("lib/codex-manager/help.ts");
+		expect(commands).toContain("## `mcodex`");
+		expect(commands).toContain("login --org");
+		expect(commands).toContain("[--requests N] [--tokens N] [--cost USD]");
+		expect(commands).not.toContain("--max-requests");
+		expect(help).toContain("--no-runtime-overlay");
+		expect(help).toContain("--max-accounts");
+		expect(help).toContain("init-config");
+	});
+
+	it("keeps the AGENTS.md package-version claim in sync with package.json", () => {
+		// This header drifted on two version bumps (2.2.0 in the audit's M6,
+		// then 2.3.0-beta.1 after the beta.2 bump); pin it to the manifest.
+		const agents = read("AGENTS.md");
+		expect(agents).toContain(`Package version: ${packageVersion}`);
+	});
+
+	it("keeps reference-doc package-version stamps in sync with package.json", () => {
+		// These three headers silently drifted from 2.6.1 through the 2.7.0,
+		// 2.7.1, and 2.8.0 releases because nothing pinned them to the manifest.
+		// Same failure class as the AGENTS.md header above, so pin them too.
+		const stampedReferenceDocs = [
+			"docs/reference/commands.md",
+			"docs/reference/public-api.md",
+			"docs/reference/settings.md",
+		];
+		for (const docPath of stampedReferenceDocs) {
+			const contents = read(docPath);
+			const stamps = [...contents.matchAll(/\(package `([^`]+)`\)/g)].map(
+				(match) => match[1],
+			);
+			expect(
+				stamps.length,
+				`${docPath} must carry a (package \`x.y.z\`) version stamp`,
+			).toBeGreaterThan(0);
+			for (const stamp of stamps) {
+				expect(stamp, `${docPath} version stamp is stale`).toBe(
+					packageVersion,
+				);
+			}
+		}
+	});
+
+	it("keeps every documented env-var name backed by shipped code", () => {
+		// CONFIG_FIELDS.md bills itself as the full inventory, so a documented
+		// name that no longer exists is a silent lie to operators. Guards the
+		// state-path group (CODEX_CLI_AUTH_PATH / _ACCOUNTS_PATH / _CONFIG_PATH,
+		// CODEX_AUTH_SYNC_CODEX_CLI) and everything else the references promise.
+		const sourceBlob = readSourceBlob();
+		const inventoryDocs = [
+			"docs/development/CONFIG_FIELDS.md",
+			"docs/reference/settings.md",
+		];
+		const unbacked: string[] = [];
+		for (const docPath of inventoryDocs) {
+			const documented = new Set(
+				[...read(docPath).matchAll(/`((?:CODEX|MCODEX|OC)_[A-Z0-9_]{3,})`/g)].map(
+					(match) => match[1],
+				),
+			);
+			for (const name of documented) {
+				if (!sourceBlob.includes(name)) unbacked.push(`${docPath}: ${name}`);
+			}
+		}
+		expect(
+			unbacked,
+			"documented env vars with no reference in lib/, scripts/, or index.ts",
+		).toEqual([]);
+	});
+
+	it("keeps the state-path and legacy-alias env names documented", () => {
+		// These four were undocumented until the 2.8.0 docs pass; pin them so a
+		// future edit cannot quietly drop them back out of the inventory.
+		const configFields = read("docs/development/CONFIG_FIELDS.md");
+		for (const name of [
+			"CODEX_CLI_AUTH_PATH",
+			"CODEX_CLI_ACCOUNTS_PATH",
+			"CODEX_CLI_CONFIG_PATH",
+			"CODEX_AUTH_SYNC_CODEX_CLI",
+		]) {
+			expect(configFields, `${name} must stay documented`).toContain(name);
+		}
+	});
+
+	it("keeps both rotation reset-runtime descriptions consistent", () => {
+		// The summary table and the rotation section drifted apart: one listed the
+		// app-bind restart, the other only the observability reset. Both must
+		// mention the bind restart so operators know the command touches it.
+		const commands = read("docs/reference/commands.md");
+		// Behavioral lines only: the bare usage block and the --json surface note
+		// mention reset-runtime without describing what it does.
+		const resetRuntimeLines = commands
+			.split(/\r?\n/)
+			.filter(
+				(line) =>
+					line.includes("reset-runtime") && /\bclears\b|\bresets\b/i.test(line),
+			);
+		expect(
+			resetRuntimeLines.length,
+			"expected reset-runtime to be described in commands.md",
+		).toBeGreaterThan(0);
+		for (const line of resetRuntimeLines) {
+			expect(
+				/bind/i.test(line),
+				`reset-runtime description omits the app-bind restart: ${line.trim().slice(0, 120)}`,
+			).toBe(true);
+		}
+	});
+
+	it("uses codex-multi-auth as canonical package name", () => {
+		const canonicalPackageDocs = [
+			"README.md",
+			"docs/index.md",
+			"docs/getting-started.md",
+			"docs/troubleshooting.md",
+			"docs/upgrade.md",
+			"docs/releases/v0.1.1.md",
+			"docs/releases/v0.1.0.md",
+		];
+
+		for (const filePath of canonicalPackageDocs) {
+			const content = read(filePath);
+			expect(content).toContain("codex-multi-auth");
+		}
+	});
+
+	it("uses scoped package only in explicit legacy migration notes", () => {
+		const files = ["README.md", ...getUserDocs()];
+
+		for (const filePath of files) {
+			const content = read(filePath);
+			const hasScopedLegacyPackage = content.includes(
+				"@ndycode/codex-multi-auth",
+			);
+			if (hasScopedLegacyPackage) {
+				expect(
+					scopedLegacyAllowedFiles.has(filePath),
+					`${filePath} should not mention @ndycode/codex-multi-auth`,
+				).toBe(true);
+			}
+		}
+	});
+
+	it("does not include opencode wording in user docs", () => {
+		const allowedOpencodeFiles = new Set([
+			"docs/reference/storage-paths.md",
+			"docs/reference/commands.md",
+			"docs/releases/v2.1.0.md",
+		]);
+		for (const filePath of getUserDocs()) {
+			const content = read(filePath).toLowerCase();
+			const hasLegacyHostWord = content.includes("opencode");
+			if (hasLegacyHostWord) {
+				expect(
+					allowedOpencodeFiles.has(filePath),
+					`${filePath} should not include opencode references`,
+				).toBe(true);
+			}
+		}
+	});
+
+	it("keeps compatibility command aliases scoped to reference, troubleshooting, or migration docs", () => {
+		const files = ["README.md", ...getUserDocs()];
+		const aliasPattern = /\bcodex (multi auth|multi-auth|multiauth)\b/i;
+
+		for (const filePath of files) {
+			const content = read(filePath);
+			const hasAlias = aliasPattern.test(content);
+			if (hasAlias) {
+				expect(
+					compatibilityAliasAllowedFiles.has(filePath),
+					`${filePath} should not include compatibility alias commands`,
+				).toBe(true);
+			}
+		}
+	});
+
+	it("keeps codex-multi-auth as the command standard in key docs", () => {
+		const keyDocs = [
+			"README.md",
+			"docs/index.md",
+			"docs/getting-started.md",
+			"docs/reference/commands.md",
+			"docs/troubleshooting.md",
+			"docs/upgrade.md",
+		];
+
+		for (const filePath of keyDocs) {
+			expect(
+				read(filePath),
+				`${filePath} must include codex-multi-auth command examples`,
+			).toContain("codex-multi-auth");
+		}
+	});
+
+	it("documents public API stability tiers and error contracts", () => {
+		const publicApi = read("docs/reference/public-api.md").toLowerCase();
+		const errorContracts = read(
+			"docs/reference/error-contracts.md",
+		).toLowerCase();
+
+		expect(publicApi).toContain("tier a");
+		expect(publicApi).toContain("tier b");
+		expect(publicApi).toContain("tier c");
+		expect(publicApi).toContain("options-object");
+		expect(publicApi).toContain("semver");
+		expect(publicApi).toContain("codex-multi-auth/auth");
+		expect(publicApi).toContain("codex-multi-auth/storage");
+		expect(publicApi).toContain("codex-multi-auth/config");
+		expect(publicApi).toContain("codex-multi-auth/request");
+		expect(publicApi).toContain("codex-multi-auth/cli");
+
+		expect(errorContracts).toContain("exit codes");
+		expect(errorContracts).toContain("json mode contract");
+		expect(errorContracts).toContain("entitlement");
+		expect(errorContracts).toContain("rate-limit");
+		expect(errorContracts).toContain("options-object compatibility contract");
+		expect(errorContracts).toContain("selecthybridaccount");
+		expect(errorContracts).toContain("exponentialbackoff");
+		expect(errorContracts).toContain("gettopcandidates");
+		expect(errorContracts).toContain("createcodexheaders");
+		expect(errorContracts).toContain("getratelimitbackoffwithreason");
+		expect(errorContracts).toContain("transformrequestbody");
+	});
+
+	it("keeps command docs aligned across README, reference, and CLI usage text", () => {
+		const readme = read("README.md");
+		const commandRef = read("docs/reference/commands.md");
+		const helpPath = "lib/codex-manager/help.ts";
+		const switchPath = "lib/codex-manager/commands/switch.ts";
+		expect(
+			existsSync(join(projectRoot, helpPath)),
+			`${helpPath} should exist`,
+		).toBe(true);
+		expect(
+			existsSync(join(projectRoot, switchPath)),
+			`${switchPath} should exist`,
+		).toBe(true);
+		const workspacePath = "lib/codex-manager/commands/workspace.ts";
+		expect(
+			existsSync(join(projectRoot, workspacePath)),
+			`${workspacePath} should exist`,
+		).toBe(true);
+		expect(commandRef).toContain(
+			"| `codex-multi-auth workspace <account> [workspace]` | List an account's tracked workspaces, or set its active workspace |",
+		);
+		expect(commandRef).toContain("## `codex-multi-auth workspace`");
+		const help = read(helpPath);
+		const switchCommand = read(switchPath);
+
+		expect(readme).toContain(
+			`codex-multi-auth fix --live --model ${DEFAULT_MODEL}`,
+		);
+		expect(commandRef).toContain(
+			"| `--json` | verify-flagged, verify, why-selected, best, forecast, report, usage, budget, models, monitor, integrations, fix, doctor, config explain, debug bundle, history |",
+		);
+		expect(commandRef).toContain(
+			"| `--explain` | forecast, report | Include reasoning details (forecast text/JSON, report text) |",
+		);
+		expect(commandRef).toContain("| `--live` | best, forecast, report, fix |");
+		expect(commandRef).toContain(
+			"| `--model <model>` | best, forecast, report, fix |",
+		);
+		expect(help).toContain("codex-multi-auth login");
+		expect(help).toContain(
+			"codex-multi-auth fix [--dry-run|-n] [--json] [--live] [--model <model>]",
+		);
+		expect(help).toContain(
+			"codex-multi-auth report [--live] [--json] [--explain] [--model <model>] [--max-accounts <n>] [--max-probes <n>] [--cached-only] [--out <path>]",
+		);
+		expect(help).toContain("codex-multi-auth config explain [--json]");
+		expect(help).toContain("codex-multi-auth debug bundle [--json]");
+		expect(help).toContain("--no-runtime-overlay");
+		expect(help).toContain("init-config");
+		expect(switchCommand).toContain(
+			"Missing index. Usage: codex-multi-auth switch <index>",
+		);
+		expect(switchCommand).not.toContain("codex-multi-auth auth switch <index>");
+	});
+
+	it("keeps maintainer runbooks present", () => {
+		const runbooks = [
+			"docs/development/RUNBOOK_ADD_AUTH_MANAGER_COMMAND.md",
+			"docs/development/RUNBOOK_ADD_CONFIG_FIELD_SAFELY.md",
+			"docs/development/RUNBOOK_CHANGE_ROUTING_POLICY_SAFELY.md",
+		];
+
+		for (const runbook of runbooks) {
+			expect(
+				existsSync(join(projectRoot, runbook)),
+				`${runbook} should exist`,
+			).toBe(true);
+		}
+	});
+
+	it("documents stable overrides separately from advanced and internal overrides", () => {
+		const configGuide = read("docs/configuration.md").toLowerCase();
+		const settingsRef = read("docs/reference/settings.md").toLowerCase();
+		const fieldInventoryPath = "docs/development/CONFIG_FIELDS.md";
+		expect(
+			existsSync(join(projectRoot, fieldInventoryPath)),
+			`${fieldInventoryPath} should exist`,
+		).toBe(true);
+		const fieldInventory = read(fieldInventoryPath).toLowerCase();
+
+		expect(configGuide).toContain("stable environment overrides");
+		expect(configGuide).toContain("advanced and internal overrides");
+		expect(settingsRef).toContain("stable environment overrides");
+		expect(settingsRef).toContain("advanced and internal overrides");
+
+		expect(fieldInventory).toContain("concurrency and windows notes");
+		expect(fieldInventory).toContain("eperm");
+		expect(fieldInventory).toContain("ebusy");
+		expect(fieldInventory).toContain("cross-process refresh");
+		expect(fieldInventory).toContain("tokenrefreshskewms");
+	});
+
+	it("locks the current Experimental settings menu labels and help text", () => {
+		expect(UI_COPY.settings.title).toBe("Settings");
+		expect(UI_COPY.settings.subtitle).toBe(
+			"Customize menu, behavior, backend, and experiments",
+		);
+		expect(UI_COPY.settings.help).toBe("↑↓ Move | Enter Select | Q Back");
+		expect(UI_COPY.settings.accountList).toBe("Account List View");
+		expect(UI_COPY.settings.summaryFields).toBe("Summary Line");
+		expect(UI_COPY.settings.behavior).toBe("Menu Behavior");
+		expect(UI_COPY.settings.theme).toBe("Color Theme");
+		expect(UI_COPY.settings.experimental).toBe("Experimental");
+		expect(UI_COPY.settings.backend).toBe("Backend Controls");
+		expect(UI_COPY.settings.accountListHelp).toBe(
+			"Enter Toggle | Number Toggle | M Sort | L Layout | S Save | Q Back (No Save)",
+		);
+		expect(UI_COPY.settings.summaryHelp).toBe(
+			"Enter Toggle | 1-3 Toggle | [ ] Reorder | S Save | Q Back (No Save)",
+		);
+		expect(UI_COPY.settings.behaviorHelp).toBe(
+			"Enter Select | 1-3 Delay | P Pause | L AutoFetch | F Status | T TTL | S Save | Q Back (No Save)",
+		);
+		expect(UI_COPY.settings.themeHelp).toBe(
+			"Enter Select | 1-2 Base | S Save | Q Back (No Save)",
+		);
+		expect(UI_COPY.settings.backendHelp).toBe(
+			"Enter Open | 1-4 Category | S Save | R Reset | Q Back (No Save)",
+		);
+	});
+
+	it("keeps settings reference sections aligned with current menu labels and backend categories", () => {
+		const settingsRef = read("docs/reference/settings.md");
+
+		expect(settingsRef).toContain(`## ${UI_COPY.settings.accountList}`);
+		expect(settingsRef).toContain(`## ${UI_COPY.settings.summaryFields}`);
+		expect(settingsRef).toContain(`## ${UI_COPY.settings.behavior}`);
+		expect(settingsRef).toContain(`## ${UI_COPY.settings.theme}`);
+		expect(settingsRef).toContain(`## ${UI_COPY.settings.experimental}`);
+		expect(settingsRef).toContain(`## ${UI_COPY.settings.backend}`);
+		expect(settingsRef).toContain("### Session & Sync");
+		expect(settingsRef).toContain("### Rotation & Quota");
+		expect(settingsRef).toContain("### Refresh & Recovery");
+		expect(settingsRef).toContain("preview is always shown before apply");
+		expect(settingsRef).toContain("Named backup behavior:");
+		expect(settingsRef).toContain("### Performance & Timeouts");
+		expect(settingsRef).toContain("- `menuShowLastUsed`");
+		expect(settingsRef).toContain("- `menuShowQuotaSummary`");
+		expect(settingsRef).toContain("- `menuShowFetchStatus`");
+		expect(settingsRef).toContain("- `menuStatuslineFields`");
+	});
+
+	it("keeps release-line docs aligned with the current 2.x policy", () => {
+		const changelog = read("CHANGELOG.md");
+		const security = read("SECURITY.md");
+		const docsGovernance = read("docs/DOCUMENTATION.md");
+		const upgradeGuide = read("docs/upgrade.md");
+		const publicApi = read("docs/reference/public-api.md");
+
+		expect(changelog).toContain("current stable release line is `2.x`");
+		expect(changelog).toContain("docs/releases/");
+		expect(security).toContain("`2.x` latest");
+		expect(security).toContain("pre-`1.0` historical releases");
+		expect(docsGovernance).toContain("Current stable release line is `2.x`");
+		expect(upgradeGuide).toContain("current `2.x` release line");
+		expect(publicApi).toContain("inside the current `2.x` line");
+		expect(publicApi).toContain("currently ships on a `2.x` line");
+	});
+
+	it("keeps the historical changelog aligned with the archived 0.x release set", () => {
+		const changelog = read("CHANGELOG.md");
+		expect(changelog).toContain("## [0.1.8] - 2026-03-11");
+		expect(changelog).toContain("## [0.1.7] - 2026-03-03");
+		expect(changelog).toContain("## [0.1.6] - 2026-03-03");
+		expect(changelog).toContain("## [0.1.0] - 2026-02-27");
+		expect(changelog).toContain("docs/releases/legacy-pre-0.1-history.md");
+		expect(changelog).not.toContain("## [5.");
+		expect(changelog).not.toContain("## [4.");
+	});
+
+	it("keeps legacy pre-0.1 archive headings in descending semver order", () => {
+		const archive = read("docs/releases/legacy-pre-0.1-history.md");
+		const versions = [...archive.matchAll(/^## \[(\d+\.\d+\.\d+)\] - /gm)].map(
+			(match) => match[1],
+		);
+		expect(versions.length).toBeGreaterThan(0);
+
+		for (let index = 1; index < versions.length; index += 1) {
+			const previous = versions[index - 1];
+			const current = versions[index];
+			const comparison = compareSemverDescending(previous, current);
+			if (comparison <= 0) {
+				throw new Error(
+					`Release heading order must be strictly descending semver, but found ${previous} before ${current}.`,
+				);
+			}
+		}
+	});
+
+	it("keeps CODEX_MULTI_AUTH_CONFIG_PATH fallback and env override precedence aligned with docs", async () => {
+		const tempRoot = mkdtempSync(join(tmpdir(), "codex-doc-config-"));
+		const fallbackConfigPath = join(tempRoot, "fallback-config.json");
+
+		try {
+			writeFileSync(
+				fallbackConfigPath,
+				`${JSON.stringify({ codexMode: false, toastDurationMs: 7777 }, null, 2)}\n`,
+				"utf-8",
+			);
+			vi.resetModules();
+			vi.stubEnv("CODEX_MULTI_AUTH_DIR", tempRoot);
+			vi.stubEnv("CODEX_MULTI_AUTH_CONFIG_PATH", fallbackConfigPath);
+			vi.stubEnv("CODEX_MODE", "1");
+			vi.stubEnv("HOME", tempRoot);
+			vi.stubEnv("USERPROFILE", tempRoot);
+
+			const { loadPluginConfig, getCodexMode } = await import(
+				"../lib/config.js"
+			);
+			const loaded = loadPluginConfig();
+			expect(loaded.codexMode).toBe(false);
+			expect(getCodexMode(loaded)).toBe(true);
+
+			const configFlow = read("docs/development/CONFIG_FLOW.md");
+			const configGuide = read("docs/configuration.md");
+			expect(configFlow).toContain(
+				"Fallback file from `CODEX_MULTI_AUTH_CONFIG_PATH`",
+			);
+			expect(configFlow).toContain(
+				"After source selection, environment variables apply per-setting overrides.",
+			);
+			expect(configGuide).toContain("CODEX_MULTI_AUTH_CONFIG_PATH");
+		} finally {
+			vi.unstubAllEnvs();
+			rmSync(tempRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps package metadata aligned with the canonical owner surface", () => {
+		const packageJson = JSON.parse(read("package.json")) as {
+			name?: unknown;
+			description?: unknown;
+			keywords?: unknown;
+			author?: unknown;
+			license?: unknown;
+			repository?: { url?: unknown } | unknown;
+			homepage?: unknown;
+			bugs?: { url?: unknown } | unknown;
+			bin?: Record<string, unknown> | unknown;
+		};
+
+		expect(packageJson.name).toBe("codex-multi-auth");
+		expect(packageJson.description).toContain("Codex CLI");
+		expect(packageJson.description).toContain("multi-account OAuth");
+		expect(packageJson.description).toContain("runtime rotation");
+		expect(packageJson.keywords).toEqual(
+			expect.arrayContaining([
+				"codex-cli",
+				"codex-auth",
+				"codex-multi-account",
+				"oauth",
+				"runtime-rotation",
+				"responses-api",
+				"quota-management",
+				"diagnostics",
+				"account-health",
+				"recovery-tools",
+			]),
+		);
+		expect(packageJson.author).toBe("ndycode");
+		expect(packageJson.license).toBe("MIT");
+		expect(packageJson.repository).toEqual({
+			type: "git",
+			url: "git+https://github.com/ndycode/codex-multi-auth.git",
+		});
+		expect(packageJson.homepage).toBe(
+			"https://github.com/ndycode/codex-multi-auth#readme",
+		);
+		expect(packageJson.bugs).toEqual({
+			url: "https://github.com/ndycode/codex-multi-auth/issues",
+		});
+		expect(packageJson.bin).toEqual({
+			mcodex: "scripts/mcodex.js",
+			"codex-multi-auth-app-launcher": "scripts/codex-app-launcher.js",
+			"codex-multi-auth-codex": "scripts/codex.js",
+			"codex-multi-auth": "scripts/codex-multi-auth.js",
+		});
+		// Every declared bin must also be published via files[]; otherwise npm can
+		// ship a package whose bin points at a missing shim (e.g. mcodex) while this
+		// test still passes on the bin map alone.
+		for (const binTarget of Object.values(packageJson.bin)) {
+			expect(packageJson.files).toEqual(
+				expect.arrayContaining([binTarget]),
+			);
+		}
+	});
+
+	it("keeps the SECURITY.md override versions aligned with package.json (docs-supplychain-03)", () => {
+		const pkg = JSON.parse(read("package.json")) as {
+			overrides?: Record<string, unknown>;
+		};
+		const security = read("SECURITY.md");
+		const honoPin = pkg.overrides?.hono;
+		expect(typeof honoPin).toBe("string");
+		// SECURITY.md cites the hono override version in its rationale; it must match
+		// the actual pin so the doc cannot silently drift (it claimed 4.12.14 while
+		// package.json pinned 4.12.18).
+		expect(security).toContain(`pinned to \`${String(honoPin)}\``);
+
+		// docs-supplychain-03 (rollup): SECURITY.md also documents a pinned rationale
+		// for the rollup override, which can drift unnoticed. SECURITY.md phrases the
+		// rollup pin as a range (`^4.59.0`) while package.json's override is the exact
+		// version (`4.59.0`), so assert the documented `^`-prefixed form.
+		const rollupPin = pkg.overrides?.rollup;
+		expect(typeof rollupPin).toBe("string");
+		expect(security).toContain(`pinned to \`^${String(rollupPin)}\``);
+	});
+
+	it("keeps governance templates and security reporting guidance present", () => {
+		const prTemplate = ".github/pull_request_template.md";
+		const issueConfig = ".github/ISSUE_TEMPLATE/config.yml";
+		const bugTemplate = ".github/ISSUE_TEMPLATE/bug_report.md";
+		const featureTemplate = ".github/ISSUE_TEMPLATE/feature_request.md";
+		const codeOfConduct = "CODE_OF_CONDUCT.md";
+
+		expect(
+			existsSync(join(projectRoot, prTemplate)),
+			`${prTemplate} should exist`,
+		).toBe(true);
+		expect(
+			existsSync(join(projectRoot, issueConfig)),
+			`${issueConfig} should exist`,
+		).toBe(true);
+		expect(
+			existsSync(join(projectRoot, bugTemplate)),
+			`${bugTemplate} should exist`,
+		).toBe(true);
+		expect(
+			existsSync(join(projectRoot, featureTemplate)),
+			`${featureTemplate} should exist`,
+		).toBe(true);
+		expect(
+			existsSync(join(projectRoot, codeOfConduct)),
+			`${codeOfConduct} should exist`,
+		).toBe(true);
+
+		const prBody = read(prTemplate);
+		expect(prBody).toContain("npm run lint");
+		expect(prBody).toContain("npm run typecheck");
+		expect(prBody).toContain("npm test");
+		expect(prBody).toContain("npm test -- test/documentation.test.ts");
+		expect(prBody).toContain("npm run build");
+
+		const security = read("SECURITY.md").toLowerCase();
+		expect(security).toContain("do not open a public issue");
+		expect(security).toContain("enable_plugin_request_logging=1");
+		expect(security).toContain("codex_plugin_log_bodies=1");
+
+		const contributing = read("CONTRIBUTING.md").toLowerCase();
+		expect(contributing).toContain("pull request process");
+		expect(contributing).toContain("npm run typecheck");
+		expect(contributing).toContain("npm run lint");
+		expect(contributing).toContain("npm test");
+		expect(contributing).toContain("npm run build");
+
+		const conduct = read("CODE_OF_CONDUCT.md").toLowerCase();
+		expect(conduct).toContain("respectful");
+		expect(conduct).toContain("security.md");
+	});
+
+	it("locks linguist overrides for a TypeScript-only repository language bar", () => {
+		const gitattributes = ".gitattributes";
+		expect(
+			existsSync(join(projectRoot, gitattributes)),
+			`${gitattributes} should exist`,
+		).toBe(true);
+
+		const content = read(gitattributes);
+		const normalized = content
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0 && !line.startsWith("#"));
+		expect(normalized).toEqual([
+			"*.ts linguist-detectable",
+			"*.js -linguist-detectable",
+			"*.mjs -linguist-detectable",
+			"*.sh -linguist-detectable",
+			"*.html -linguist-detectable",
+			"config/schema/config.schema.json text eol=lf",
+		]);
+	});
+
+	it("publishes maintainer runbooks for refactor-era changes", () => {
+		const docsPortal = read("docs/README.md");
+		const testingGuide = read("docs/development/TESTING.md");
+
+		for (const filePath of maintainerRunbooks) {
+			expect(
+				existsSync(join(projectRoot, filePath)),
+				`${filePath} should exist`,
+			).toBe(true);
+			const content = read(filePath).toLowerCase();
+			expect(content).toContain("validation");
+			expect(content).toContain("review checklist");
+		}
+
+		expect(docsPortal).toContain("development/RUNBOOK_ADD_AUTH_COMMAND.md");
+		expect(docsPortal).toContain("development/RUNBOOK_ADD_CONFIG_FIELD.md");
+		expect(docsPortal).toContain(
+			"development/RUNBOOK_CHANGE_ROUTING_POLICY.md",
+		);
+		expect(testingGuide).toContain("## Refactor Guardrail Checklist");
+		expect(testingGuide).toContain("stream: true");
+		expect(testingGuide).toContain("store: false");
+		expect(testingGuide).toContain("reasoning.encrypted_content");
+	});
+
+	it("has valid internal links in README.md", () => {
+		const content = read("README.md");
+		const links = extractInternalLinks(content);
+
+		for (const link of links) {
+			const cleanPath = link.split("#")[0];
+			if (!cleanPath) {
+				continue;
+			}
+			expect(
+				existsSync(join(projectRoot, cleanPath)),
+				`Missing link target: ${cleanPath}`,
+			).toBe(true);
+		}
+	});
+
+	it("ignores URI scheme links during docs link validation", () => {
+		const tempDocsRoot = mkdtempSync(join(tmpdir(), "codex-doc-links-"));
+
+		try {
+			const nestedDir = join(tempDocsRoot, "nested");
+			mkdirSync(nestedDir, { recursive: true });
+			writeFileSync(
+				join(tempDocsRoot, "index.md"),
+				[
+					"# Temporary docs",
+					"[Guide](./nested/guide.md)",
+					"[Mail](mailto:support@example.com)",
+					"[Phone](tel:+1234567890)",
+					"[Scheme relative](//example.com/path)",
+				].join("\n"),
+				"utf-8",
+			);
+			writeFileSync(join(nestedDir, "guide.md"), "# Guide\n", "utf-8");
+
+			const docsMarkdownFiles = listMarkdownFiles(tempDocsRoot);
+			const missingTargets: string[] = [];
+
+			for (const filePath of docsMarkdownFiles) {
+				const content = readFileSync(filePath, "utf-8");
+				const links = extractInternalLinks(content);
+				for (const link of links) {
+					const cleanPath = link.split("#")[0];
+					if (!cleanPath || isExternalOrUriSchemeLink(cleanPath)) {
+						continue;
+					}
+					const targetPath = resolve(dirname(filePath), cleanPath);
+					if (!existsSync(targetPath)) {
+						missingTargets.push(`${filePath}: ${cleanPath}`);
+					}
+				}
+			}
+
+			expect(missingTargets).toEqual([]);
+		} finally {
+			rmSync(tempDocsRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("has valid internal links in markdown files under docs/", () => {
+		const docsRoot = join(projectRoot, "docs");
+		const docsMarkdownFiles = listMarkdownFiles(docsRoot);
+
+		for (const filePath of docsMarkdownFiles) {
+			const content = readFileSync(filePath, "utf-8");
+			const links = extractInternalLinks(content);
+			for (const link of links) {
+				const cleanPath = link.split("#")[0];
+				if (!cleanPath) {
+					continue;
+				}
+				if (isExternalOrUriSchemeLink(cleanPath)) {
+					continue;
+				}
+				const targetPath = resolve(dirname(filePath), cleanPath);
+				expect(
+					existsSync(targetPath),
+					`Missing docs link in ${filePath.replace(projectRoot, "")}: ${cleanPath}`,
+				).toBe(true);
+			}
+		}
+	});
+});

@@ -1,0 +1,977 @@
+import { describe, expect, it, vi } from "vitest";
+import {
+	type ReportCommandDeps,
+	runReportCommand,
+} from "../lib/codex-manager/commands/report.js";
+import { CodexUnavailableError } from "../lib/errors.js";
+import { DEFAULT_PROBE_MODEL } from "../lib/request/helpers/model-map.js";
+import { CODEX_UNAVAILABLE_PROBE_NOTE } from "../lib/quota-probe.js";
+import type { AccountStorageV3, StorageHealthSummary } from "../lib/storage.js";
+
+function createStorage(
+	accounts: AccountStorageV3["accounts"] = [
+		{
+			email: "one@example.com",
+			refreshToken: "refresh-token-1",
+			accessToken: "access-token-1",
+			expiresAt: 10,
+			addedAt: 1,
+			lastUsed: 1,
+			enabled: true,
+		},
+	],
+): AccountStorageV3 {
+	return {
+		version: 3,
+		activeIndex: 0,
+		activeIndexByFamily: { codex: 0 },
+		accounts,
+	};
+}
+
+function createDeps(
+	overrides: Partial<ReportCommandDeps> = {},
+): ReportCommandDeps {
+	return {
+		setStoragePath: vi.fn(),
+		getStoragePath: vi.fn(() => "/mock/openai-codex-accounts.json"),
+		loadAccounts: vi.fn(async () => createStorage()),
+		saveAccounts: vi.fn(async () => undefined),
+		resolveActiveIndex: vi.fn(() => 0),
+		hasUsableAccessToken: vi.fn(() => false),
+		queuedRefresh: vi.fn(async () => ({
+			type: "success",
+			access: "access-token-1",
+			refresh: "refresh-token-1",
+			expires: 100,
+			idToken: "id-token-1",
+		})),
+		fetchCodexQuotaSnapshot: vi.fn(async () => ({
+			status: 200,
+			model: "gpt-5.3-codex",
+			primary: {},
+			secondary: {},
+		})),
+		formatRateLimitEntry: vi.fn(() => null),
+		inspectStorageHealth: vi.fn(async (): Promise<StorageHealthSummary> => ({
+			state: "healthy",
+			path: "/mock/openai-codex-accounts.json",
+			resetMarkerPath: "/mock/openai-codex-accounts.json.intentional-reset",
+			walPath: "/mock/openai-codex-accounts.json.wal",
+			hasResetMarker: false,
+			hasWal: false,
+		})),
+		loadRuntimeObservabilitySnapshot: vi.fn(async () => null),
+		normalizeFailureDetail: vi.fn((message) => message ?? "unknown"),
+		logInfo: vi.fn(),
+		logError: vi.fn(),
+		getNow: vi.fn(() => 1_000),
+		getCwd: vi.fn(() => "/repo"),
+		writeFile: vi.fn(async () => undefined),
+		...overrides,
+	};
+}
+
+describe("runReportCommand", () => {
+	it("prints usage for help", async () => {
+		const deps = createDeps();
+
+		const result = await runReportCommand(["--help"], deps);
+
+		expect(result).toBe(0);
+		expect(deps.logInfo).toHaveBeenCalledWith(
+			expect.stringContaining("Usage: codex-multi-auth report"),
+		);
+	});
+
+	it("rejects invalid options", async () => {
+		const deps = createDeps();
+
+		const result = await runReportCommand(["--bogus"], deps);
+
+		expect(result).toBe(1);
+		expect(deps.logError).toHaveBeenCalledWith("Unknown option: --bogus");
+	});
+
+	it("gates the forecast on the requested model's family record", async () => {
+		const storage = createStorage([
+			{
+				email: "one@example.com",
+				refreshToken: "refresh-token-1",
+				accessToken: "access-token-1",
+				expiresAt: 10,
+				addedAt: 1,
+				lastUsed: 1,
+				enabled: true,
+				rateLimitResetTimes: { "gpt-5.2": 31_000 },
+			},
+		]);
+		const deps = createDeps({ loadAccounts: vi.fn(async () => storage) });
+
+		const readForecast = (): {
+			accounts: Array<{ availability: string; reasons: string[] }>;
+		} =>
+			(
+				JSON.parse(
+					String(
+						(deps.logInfo as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] ??
+							"{}",
+					),
+				) as {
+					forecast: {
+						accounts: Array<{ availability: string; reasons: string[] }>;
+					};
+				}
+			).forecast;
+
+		// The record is under the gpt-5.2 family, which gpt-5.6-sol belongs to.
+		await expect(
+			runReportCommand(["--json", "--model", "gpt-5.6-sol"], deps),
+		).resolves.toBe(0);
+		const general = readForecast();
+		expect(general.accounts[0]?.availability).toBe("delayed");
+		expect(
+			general.accounts[0]?.reasons.some((reason) =>
+				reason.startsWith("rate limit resets in"),
+			),
+		).toBe(true);
+
+		// A codex-family model is not gated by that record.
+		await expect(
+			runReportCommand(["--json", "--model", "gpt-5.3-codex"], deps),
+		).resolves.toBe(0);
+		const codex = readForecast();
+		expect(codex.accounts[0]?.availability).toBe("ready");
+	});
+
+	it("keeps a bare report on the codex family", async () => {
+		const storage = createStorage([
+			{
+				email: "one@example.com",
+				refreshToken: "refresh-token-1",
+				accessToken: "access-token-1",
+				expiresAt: 10,
+				addedAt: 1,
+				lastUsed: 1,
+				enabled: true,
+				rateLimitResetTimes: { codex: 31_000 },
+			},
+		]);
+		const deps = createDeps({ loadAccounts: vi.fn(async () => storage) });
+
+		// DEFAULT_PROBE_MODEL is gpt-5.6-sol, whose family is gpt-5.2. Keying the
+		// no-flag invocation on it would report this account ready while every
+		// /codex/responses request 503s off the very same record.
+		await expect(runReportCommand(["--json"], deps)).resolves.toBe(0);
+		const forecast = (
+			JSON.parse(
+				String(
+					(deps.logInfo as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] ??
+						"{}",
+				),
+			) as {
+				forecast: {
+					accounts: Array<{ availability: string; reasons: string[] }>;
+				};
+			}
+		).forecast;
+		expect(forecast.accounts[0]?.availability).toBe("delayed");
+		expect(
+			forecast.accounts[0]?.reasons.some((reason) =>
+				reason.startsWith("rate limit resets in"),
+			),
+		).toBe(true);
+	});
+
+	it("does not gate the forecast on a sibling model's record in the same family", async () => {
+		const storage = createStorage([
+			{
+				email: "one@example.com",
+				refreshToken: "refresh-token-1",
+				accessToken: "access-token-1",
+				expiresAt: 10,
+				addedAt: 1,
+				lastUsed: 1,
+				enabled: true,
+				// A token/concurrency limit on a sibling model, keyed
+				// `family:<model>` the way markRateLimitedWithReason writes it.
+				rateLimitResetTimes: { "gpt-5.2:gpt-5.6-terra": 31_000 },
+			},
+		]);
+		const deps = createDeps({ loadAccounts: vi.fn(async () => storage) });
+
+		const readForecast = (): {
+			accounts: Array<{ availability: string; reasons: string[] }>;
+		} =>
+			(
+				JSON.parse(
+					String(
+						(deps.logInfo as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] ??
+							"{}",
+					),
+				) as {
+					forecast: {
+						accounts: Array<{ availability: string; reasons: string[] }>;
+					};
+				}
+			).forecast;
+
+		// Selection checks `gpt-5.2` and `gpt-5.2:gpt-5.6-sol`, neither of which
+		// is set - the proxy serves this model, so the report must not say wait.
+		await expect(
+			runReportCommand(["--json", "--model", "gpt-5.6-sol"], deps),
+		).resolves.toBe(0);
+		expect(readForecast().accounts[0]?.availability).toBe("ready");
+
+		// The model the record actually names is still gated.
+		await expect(
+			runReportCommand(["--json", "--model", "gpt-5.6-terra"], deps),
+		).resolves.toBe(0);
+		const own = readForecast();
+		expect(own.accounts[0]?.availability).toBe("delayed");
+		expect(
+			own.accounts[0]?.reasons.some((reason) =>
+				reason.startsWith("rate limit resets in"),
+			),
+		).toBe(true);
+	});
+
+	it("rejects a flag-like or whitespace-only --model value instead of consuming it", async () => {
+		// Split-arg form trims before validating, so "  -x" / "   " can't slip
+		// through and silently fall back to the default model.
+		for (const bad of ["--json", "  -x", "   "]) {
+			const deps = createDeps();
+			const result = await runReportCommand(["--model", bad], deps);
+			expect(result).toBe(1);
+			expect(deps.logError).toHaveBeenCalledWith("Missing value for --model");
+		}
+	});
+
+	it("rejects invalid live probe budget values", async () => {
+		const deps = createDeps();
+
+		const result = await runReportCommand(["--max-probes", "0"], deps);
+
+		expect(result).toBe(1);
+		expect(deps.logError).toHaveBeenCalledWith(
+			"--max-probes must be a positive integer",
+		);
+	});
+
+	it.each([
+		["--max-accounts", "1.9", "--max-accounts must be a positive integer"],
+		["--max-accounts", "1e3", "--max-accounts must be a positive integer"],
+		["--max-accounts", "2foo", "--max-accounts must be a positive integer"],
+		["--max-probes", "1.9", "--max-probes must be a positive integer"],
+		["--max-probes", "1e3", "--max-probes must be a positive integer"],
+		["--max-probes", "2foo", "--max-probes must be a positive integer"],
+	] as const)("rejects malformed numeric flags %s %s", async (flag, value, message) => {
+		const deps = createDeps();
+
+		const result = await runReportCommand([flag, value], deps);
+
+		expect(result).toBe(1);
+		expect(deps.logError).toHaveBeenCalledWith(message);
+	});
+
+	it("writes json report output when requested", async () => {
+		const deps = createDeps();
+
+		const result = await runReportCommand(
+			["--json", "--out", "report.json"],
+			deps,
+		);
+
+		expect(result).toBe(0);
+		expect(deps.writeFile).toHaveBeenCalledWith(
+			expect.stringContaining("report.json"),
+			expect.stringContaining('"command": "report"'),
+		);
+		expect(deps.logInfo).toHaveBeenCalledWith(
+			expect.stringContaining('"forecast"'),
+		);
+		expect(deps.logInfo).toHaveBeenCalledWith(
+			expect.stringContaining('"liveProbeBudget"'),
+		);
+		expect(deps.logInfo).toHaveBeenCalledWith(
+			expect.stringContaining('"storageHealth"'),
+		);
+	});
+
+	it("uses quota cache when computing non-live forecast readiness", async () => {
+		const deps = createDeps({
+			loadAccounts: vi.fn(async () =>
+				createStorage([
+					{
+						email: "quota@example.com",
+						refreshToken: "refresh-token-1",
+						accessToken: "access-token-1",
+						expiresAt: 10_000,
+						addedAt: 1,
+						lastUsed: 1,
+						accountId: "quota-account",
+						enabled: true,
+					},
+				]),
+			),
+			loadQuotaCache: vi.fn(async () => ({
+				byAccountId: {
+					"quota-account": {
+						updatedAt: 900,
+						status: 200,
+						model: "gpt-5.3-codex",
+						primary: { usedPercent: 100, resetAtMs: 61_000 },
+						secondary: {},
+					},
+				},
+				byEmail: {},
+			})),
+		});
+
+		const result = await runReportCommand(["--json"], deps);
+
+		expect(result).toBe(0);
+		expect(deps.loadQuotaCache).toHaveBeenCalledTimes(1);
+		const payload = JSON.parse(
+			String(
+				(deps.logInfo as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] ??
+					"{}",
+			),
+		) as {
+			forecast: { accounts: Array<{ availability: string; reasons: string[] }> };
+		};
+		expect(payload.forecast.accounts[0]?.availability).toBe("delayed");
+		expect(payload.forecast.accounts[0]?.reasons).toContain(
+			"quota cache exhausted",
+		);
+	});
+
+	it("includes runtime observability fields in json output when snapshot is available", async () => {
+		const deps = createDeps({
+			loadRuntimeObservabilitySnapshot: vi.fn(async () => ({
+				version: 1,
+				updatedAt: 2000,
+				responsesRequests: 4,
+				authRefreshRequests: 2,
+				diagnosticProbeRequests: 1,
+				currentRequestId: "req_123",
+				poolExhaustionCooldownUntil: 9000,
+				serverBurstCooldownUntil: 12000,
+				runtimeMetrics: {
+					startedAt: 1000,
+					totalRequests: 4,
+					successfulRequests: 3,
+					failedRequests: 1,
+					responsesRequests: 4,
+					authRefreshRequests: 2,
+					diagnosticProbeRequests: 1,
+					outboundRequestAttemptBudget: 6,
+					outboundRequestAttemptsConsumed: 5,
+					requestAttemptBudgetExhaustions: 0,
+					poolExhaustionFastFails: 1,
+					serverBurstFastFails: 0,
+					rateLimitedResponses: 1,
+					serverErrors: 0,
+					networkErrors: 0,
+					userAborts: 0,
+					authRefreshFailures: 0,
+					emptyResponseRetries: 0,
+					accountRotations: 1,
+					sameAccountRetries: 0,
+					streamFailoverAttempts: 0,
+					streamFailoverCandidatesConsidered: 0,
+					lastStreamFailoverCandidateCount: 0,
+					streamFailoverRecoveries: 0,
+					streamFailoverCrossAccountRecoveries: 0,
+					cumulativeLatencyMs: 42,
+					lastRequestAt: 1999,
+					lastError: null,
+				},
+			})),
+		});
+
+		const result = await runReportCommand(["--json"], deps);
+
+		expect(result).toBe(0);
+		const jsonOutput = JSON.parse(
+			(deps.logInfo as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] ?? "{}",
+		) as {
+			runtime: {
+				poolExhaustionCooldownUntil: number;
+				serverBurstCooldownUntil: number;
+				runtimeMetrics: Record<string, unknown>;
+			};
+		};
+		expect(jsonOutput.runtime.poolExhaustionCooldownUntil).toBe(9000);
+		expect(jsonOutput.runtime.serverBurstCooldownUntil).toBe(12000);
+		expect(jsonOutput.runtime.runtimeMetrics).toBeDefined();
+	});
+
+	it("applies runtime overlay to report forecast output", async () => {
+		const deps = createDeps({
+			loadRuntimeObservabilitySnapshot: vi.fn(async () => ({
+				version: 1,
+				updatedAt: 2000,
+				responsesRequests: 0,
+				authRefreshRequests: 0,
+				diagnosticProbeRequests: 0,
+				currentRequestId: null,
+				poolExhaustionCooldownUntil: null,
+				serverBurstCooldownUntil: null,
+				lastPoolExhaustionSkipReasons: { "0": "circuit-open" },
+				runtimeMetrics: {
+					startedAt: 1000,
+					totalRequests: 0,
+					successfulRequests: 0,
+					failedRequests: 0,
+					responsesRequests: 0,
+					authRefreshRequests: 0,
+					diagnosticProbeRequests: 0,
+					outboundRequestAttemptBudget: null,
+					outboundRequestAttemptsConsumed: 0,
+					requestAttemptBudgetExhaustions: 0,
+					poolExhaustionFastFails: 0,
+					serverBurstFastFails: 0,
+					rateLimitedResponses: 0,
+					serverErrors: 0,
+					networkErrors: 0,
+					userAborts: 0,
+					authRefreshFailures: 0,
+					emptyResponseRetries: 0,
+					accountRotations: 0,
+					sameAccountRetries: 0,
+					streamFailoverAttempts: 0,
+					streamFailoverCandidatesConsidered: 0,
+					lastStreamFailoverCandidateCount: 0,
+					streamFailoverRecoveries: 0,
+					streamFailoverCrossAccountRecoveries: 0,
+					cumulativeLatencyMs: 0,
+					lastRequestAt: null,
+					lastError: null,
+				},
+			})),
+		});
+
+		await expect(runReportCommand(["--json"], deps)).resolves.toBe(0);
+
+		const jsonOutput = JSON.parse(
+			(deps.logInfo as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] ?? "{}",
+		) as {
+			runtimeOverlay: boolean;
+			runtimeSnapshotLoadError: string | null;
+			forecast: { accounts: Array<{ availability: string; reasons: string[] }> };
+			runtime: { lastPoolExhaustionSkipReasons: Record<string, string> };
+		};
+		expect(jsonOutput.runtimeOverlay).toBe(true);
+		expect(jsonOutput.runtimeSnapshotLoadError).toBeNull();
+		expect(jsonOutput.runtime.lastPoolExhaustionSkipReasons).toEqual({
+			"0": "circuit-open",
+		});
+		expect(jsonOutput.forecast.accounts[0]?.availability).toBe("unavailable");
+		expect(jsonOutput.forecast.accounts[0]?.reasons).toContain(
+			"runtime skip: circuit-open",
+		);
+	});
+
+	it("continues report generation when runtime snapshot loading fails", async () => {
+		const deps = createDeps({
+			loadRuntimeObservabilitySnapshot: vi.fn(async () => {
+				throw new Error("snapshot busy");
+			}),
+		});
+
+		await expect(runReportCommand(["--json"], deps)).resolves.toBe(0);
+
+		const jsonOutput = JSON.parse(
+			(deps.logInfo as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] ?? "{}",
+		) as {
+			runtimeOverlay: boolean;
+			runtime: null;
+			runtimeSnapshotLoadError: string;
+			forecast: { accounts: Array<{ availability: string }> };
+		};
+		expect(deps.logError).toHaveBeenCalledWith(
+			"Runtime observability snapshot unavailable: snapshot busy",
+		);
+		expect(jsonOutput.runtimeOverlay).toBe(false);
+		expect(jsonOutput.runtime).toBeNull();
+		expect(jsonOutput.runtimeSnapshotLoadError).toBe("snapshot busy");
+		expect(jsonOutput.forecast.accounts[0]?.availability).toBe("ready");
+	});
+
+	it("respects live probe account and probe budgets", async () => {
+		const deps = createDeps({
+			loadAccounts: vi.fn(async () =>
+				createStorage([
+					{ email: "one@example.com", refreshToken: "r1", accessToken: "a1", accountId: "acct-1", expiresAt: 5_000, addedAt: 1, lastUsed: 1, enabled: true },
+					{ email: "two@example.com", refreshToken: "r2", accessToken: "a2", accountId: "acct-2", expiresAt: 5_000, addedAt: 2, lastUsed: 2, enabled: true },
+					{ email: "three@example.com", refreshToken: "r3", accessToken: "a3", accountId: "acct-3", expiresAt: 5_000, addedAt: 3, lastUsed: 3, enabled: true },
+				]),
+			),
+			hasUsableAccessToken: vi.fn(() => true),
+		});
+
+		const result = await runReportCommand(
+			["--live", "--json", "--max-accounts", "2", "--max-probes", "1"],
+			deps,
+		);
+
+		expect(result).toBe(0);
+		expect(deps.fetchCodexQuotaSnapshot).toHaveBeenCalledTimes(1);
+		const jsonOutput = JSON.parse(
+			(deps.logInfo as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] ?? "{}",
+		) as { liveProbeBudget: { consideredAccounts: number; executedProbes: number }; forecast: { probeErrors: string[] } };
+		expect(jsonOutput.liveProbeBudget).toEqual(
+			expect.objectContaining({ consideredAccounts: 2, executedProbes: 1 }),
+		);
+		expect(jsonOutput.forecast.probeErrors).toEqual(
+			expect.arrayContaining([
+				expect.stringContaining("live probe request budget reached (1)"),
+			]),
+		);
+	});
+
+	it("skips refreshes in cached-only live mode", async () => {
+		const deps = createDeps({
+			hasUsableAccessToken: vi.fn(() => false),
+		});
+
+		const result = await runReportCommand(["--live", "--json", "--cached-only"], deps);
+
+		expect(result).toBe(0);
+		expect(deps.queuedRefresh).not.toHaveBeenCalled();
+		expect(deps.fetchCodexQuotaSnapshot).not.toHaveBeenCalled();
+		const jsonOutput = JSON.parse(
+			(deps.logInfo as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] ?? "{}",
+		) as { forecast: { probeErrors: string[] } };
+		expect(jsonOutput.forecast.probeErrors).toEqual(
+			expect.arrayContaining([
+				expect.stringContaining("skipped refresh because --cached-only is enabled"),
+			]),
+		);
+	});
+
+	it("covers live probe refresh failures, missing account ids, and probe errors", async () => {
+		const deps = createDeps({
+			loadAccounts: vi.fn(async () =>
+				createStorage([
+					{
+						email: "refresh-fail@example.com",
+						refreshToken: "refresh-fail",
+						addedAt: 1,
+						lastUsed: 1,
+						enabled: true,
+					},
+					{
+						email: "missing-id@example.com",
+						refreshToken: "missing-id",
+						addedAt: 2,
+						lastUsed: 2,
+						enabled: true,
+					},
+					{
+						email: "probe-error@example.com",
+						refreshToken: "probe-error",
+						accountId: "acct-probe-error",
+						addedAt: 3,
+						lastUsed: 3,
+						enabled: true,
+					},
+					{
+						email: "ok@example.com",
+						refreshToken: "ok-refresh",
+						accountId: "acct-ok",
+						addedAt: 4,
+						lastUsed: 4,
+						enabled: true,
+					},
+				]),
+			),
+			resolveActiveIndex: vi.fn(() => 3),
+			queuedRefresh: vi.fn(async (refreshToken: string) => {
+				if (refreshToken === "refresh-fail") {
+					return {
+						type: "error",
+						reason: "auth-failure",
+						message: "token expired",
+					};
+				}
+				return {
+					type: "success",
+					access:
+						refreshToken === "missing-id"
+							? "not-a-jwt"
+							: `access-${refreshToken}`,
+					refresh: refreshToken,
+					expires: 100,
+					idToken: `id-${refreshToken}`,
+				};
+			}),
+			fetchCodexQuotaSnapshot: vi.fn(async ({ accountId }) => {
+				if (accountId === "acct-probe-error") {
+					throw new Error("quota endpoint down");
+				}
+				return {
+					status: 200,
+					model: "gpt-5-codex",
+					planType: "pro",
+					primary: {},
+					secondary: {},
+				};
+			}),
+		});
+
+		const result = await runReportCommand(["--live", "--json"], deps);
+
+		expect(result).toBe(0);
+		expect(deps.fetchCodexQuotaSnapshot).toHaveBeenCalledTimes(2);
+		const jsonOutput = JSON.parse(
+			(deps.logInfo as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] ?? "{}",
+		) as {
+			forecast: {
+				probeErrors: string[];
+				accounts: Array<{ refreshFailure?: { message?: string }; liveQuota?: { planType?: string } }>;
+			};
+		};
+		expect(jsonOutput.forecast.probeErrors).toEqual(
+			expect.arrayContaining([
+				expect.stringContaining("missing accountId for live probe"),
+				expect.stringContaining("quota endpoint down"),
+			]),
+		);
+		expect(jsonOutput.forecast.accounts[0]?.refreshFailure?.message).toBe(
+			"token expired",
+		);
+		expect(jsonOutput.forecast.accounts[3]?.liveQuota?.planType).toBe("pro");
+		expect(jsonOutput.forecast.recommendation.selectedReason).toEqual(
+			"Lowest risk ready account (low, score 0).",
+		);
+	});
+
+	it("reuses usable access tokens for live probes without forcing refresh", async () => {
+		const deps = createDeps({
+			hasUsableAccessToken: vi.fn(() => true),
+			loadAccounts: vi.fn(async () =>
+				createStorage([
+					{
+						email: "one@example.com",
+						accountId: "acct-live",
+						refreshToken: "refresh-token-1",
+						accessToken: "access-token-1",
+						expiresAt: 5_000,
+						addedAt: 1,
+						lastUsed: 1,
+						enabled: true,
+					},
+				]),
+			),
+		});
+
+		const result = await runReportCommand(["--live", "--json"], deps);
+
+		expect(result).toBe(0);
+		expect(deps.queuedRefresh).not.toHaveBeenCalled();
+		expect(deps.saveAccounts).not.toHaveBeenCalled();
+		expect(deps.fetchCodexQuotaSnapshot).toHaveBeenCalledWith({
+			accountId: "acct-live",
+			accessToken: "access-token-1",
+			model: DEFAULT_PROBE_MODEL,
+		});
+	});
+
+	it("records probe error when usable token exists but account id is missing", async () => {
+		const deps = createDeps({
+			hasUsableAccessToken: vi.fn(() => true),
+			loadAccounts: vi.fn(async () =>
+				createStorage([
+					{
+						email: "missing-id@example.com",
+						refreshToken: "refresh-token-1",
+						accessToken: "not-a-jwt",
+						expiresAt: 5_000,
+						addedAt: 1,
+						lastUsed: 1,
+						enabled: true,
+					},
+				]),
+			),
+		});
+
+		const result = await runReportCommand(["--live", "--json"], deps);
+
+		expect(result).toBe(0);
+		expect(deps.queuedRefresh).not.toHaveBeenCalled();
+		expect(deps.saveAccounts).not.toHaveBeenCalled();
+		expect(deps.fetchCodexQuotaSnapshot).not.toHaveBeenCalled();
+		const jsonOutput = JSON.parse(
+			(deps.logInfo as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] ?? "{}",
+		) as { forecast: { probeErrors: string[] } };
+		expect(jsonOutput.forecast.probeErrors).toEqual(
+			expect.arrayContaining([
+				expect.stringContaining("missing accountId for live probe"),
+			]),
+		);
+	});
+
+	it("persists refreshed probe tokens before report live probes", async () => {
+		const storage = createStorage([
+			{
+				email: "one@example.com",
+				accountId: "acct-report",
+				accountIdSource: "org",
+				refreshToken: "refresh-token-1",
+				accessToken: "access-token-1",
+				expiresAt: 10,
+				addedAt: 1,
+				lastUsed: 1,
+				enabled: true,
+			},
+		]);
+		const concurrentStorage = createStorage([
+			{
+				email: "one@example.com",
+				accountId: "acct-report",
+				accountIdSource: "org",
+				refreshToken: "refresh-token-1",
+				accessToken: "access-token-1",
+				expiresAt: 10,
+				currentWorkspaceIndex: 5,
+				addedAt: 1,
+				lastUsed: 1,
+				enabled: true,
+			},
+		]);
+		const callLog: string[] = [];
+		let persistedStorage: AccountStorageV3 | null = null;
+		let loadCount = 0;
+		const deps = createDeps({
+			loadAccounts: vi.fn(async () => {
+				loadCount += 1;
+				return loadCount === 1 ? storage : structuredClone(concurrentStorage);
+			}),
+			saveAccounts: vi.fn(async (nextStorage) => {
+				callLog.push(
+					`save-${callLog.filter((entry) => entry.startsWith("save-")).length + 1}`,
+				);
+				if (callLog.length === 1) {
+					throw Object.assign(new Error("EPERM write blocked"), {
+						code: "EPERM",
+					});
+				}
+				persistedStorage = structuredClone(nextStorage);
+			}),
+			queuedRefresh: vi.fn(async () => ({
+				type: "success",
+				access: "access-token-updated",
+				refresh: "refresh-token-updated",
+				expires: 500,
+				idToken: "id-token-updated",
+			})),
+			fetchCodexQuotaSnapshot: vi.fn(async (input) => {
+				callLog.push("fetch");
+				expect(persistedStorage?.accounts[0]?.refreshToken).toBe(
+					"refresh-token-updated",
+				);
+				expect(persistedStorage?.accounts[0]?.accessToken).toBe(
+					"access-token-updated",
+				);
+				expect(persistedStorage?.accounts[0]?.currentWorkspaceIndex).toBe(5);
+				expect(input.accessToken).toBe(
+					persistedStorage?.accounts[0]?.accessToken,
+				);
+				return {
+					status: 200,
+					model: "gpt-5-codex",
+					primary: {},
+					secondary: {},
+				};
+			}),
+		});
+
+		const result = await runReportCommand(["--live", "--json"], deps);
+
+		expect(result).toBe(0);
+		expect(callLog).toEqual(["save-1", "save-2", "fetch"]);
+		expect(deps.loadAccounts).toHaveBeenCalledTimes(2);
+		expect(deps.saveAccounts).toHaveBeenCalledTimes(2);
+		expect(deps.saveAccounts).toHaveBeenCalledWith(
+			expect.objectContaining({
+				accounts: [
+					expect.objectContaining({
+						refreshToken: "refresh-token-updated",
+						accessToken: "access-token-updated",
+						expiresAt: 500,
+						accountId: "acct-report",
+						accountIdSource: "org",
+						currentWorkspaceIndex: 5,
+					}),
+				],
+			}),
+		);
+		expect(deps.fetchCodexQuotaSnapshot).toHaveBeenCalledWith(
+			expect.objectContaining({
+				accountId: "acct-report",
+				accessToken: "access-token-updated",
+			}),
+		);
+	});
+
+	it("does not mutate the in-memory report snapshot when refreshed token persistence fails", async () => {
+		const storage = createStorage([
+			{
+				email: "persist-fail@example.com",
+				accountId: "acct-report",
+				accountIdSource: "org",
+				refreshToken: "refresh-token-1",
+				accessToken: "access-token-1",
+				expiresAt: 10,
+				addedAt: 1,
+				lastUsed: 1,
+				enabled: true,
+			},
+		]);
+		const deps = createDeps({
+			loadAccounts: vi.fn(async () => structuredClone(storage)),
+			saveAccounts: vi.fn(async () => {
+				throw Object.assign(new Error("EPERM write blocked"), {
+					code: "EPERM",
+				});
+			}),
+			queuedRefresh: vi.fn(async () => ({
+				type: "success",
+				access: "access-token-updated",
+				refresh: "refresh-token-updated",
+				expires: 500,
+				idToken: "id-token-updated",
+			})),
+			fetchCodexQuotaSnapshot: vi.fn(async () => ({
+				status: 200,
+				model: "gpt-5-codex",
+				primary: {},
+				secondary: {},
+			})),
+		});
+
+		const result = await runReportCommand(["--live", "--json"], deps);
+
+		expect(result).toBe(0);
+		expect(deps.fetchCodexQuotaSnapshot).not.toHaveBeenCalled();
+		expect(deps.saveAccounts).toHaveBeenCalledTimes(4);
+		const jsonOutput = JSON.parse(
+			(deps.logInfo as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] ?? "{}",
+		) as {
+			forecast: { probeErrors: string[]; accounts: Array<{ label: string }> };
+		};
+		expect(jsonOutput.forecast.probeErrors).toEqual(
+			expect.arrayContaining([
+				expect.stringContaining("EPERM write blocked"),
+			]),
+		);
+		expect(storage.accounts[0]?.refreshToken).toBe("refresh-token-1");
+		expect(storage.accounts[0]?.accessToken).toBe("access-token-1");
+	});
+
+	it("prints a human-readable report and announces the output path", async () => {
+		const deps = createDeps();
+
+		const result = await runReportCommand(["--out", "report.json"], deps);
+
+		expect(result).toBe(0);
+		const [[writtenPath, writtenReport]] = (
+			deps.writeFile as ReturnType<typeof vi.fn>
+		).mock.calls;
+		expect(String(writtenPath).replaceAll("\\", "/")).toContain(
+			"/repo/report.json",
+		);
+		expect(String(writtenReport)).toContain('"command": "report"');
+		const infoLines = (deps.logInfo as ReturnType<typeof vi.fn>).mock.calls.map(
+			([message]) => String(message).replaceAll("\\", "/"),
+		);
+		expect(infoLines.some((line) => line.includes("Accounts: 1 total"))).toBe(
+			true,
+		);
+		expect(
+			infoLines.some((line) => line.includes("Recommendation: account 1")),
+		).toBe(true);
+		expect(
+			infoLines.some(
+				(line) =>
+					line.startsWith("Report written: ") &&
+					line.endsWith("/repo/report.json"),
+			),
+		).toBe(true);
+	});
+
+	it("reports an empty storage snapshot when no accounts are loaded", async () => {
+		const deps = createDeps({
+			loadAccounts: vi.fn(async () => null),
+		});
+
+		const result = await runReportCommand(["--json"], deps);
+
+		expect(result).toBe(0);
+		expect(deps.resolveActiveIndex).not.toHaveBeenCalled();
+		const jsonOutput = JSON.parse(
+			(deps.logInfo as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] ?? "{}",
+		) as {
+			accounts: { total: number };
+			activeIndex: number | null;
+		};
+		expect(jsonOutput.accounts.total).toBe(0);
+		expect(jsonOutput.activeIndex).toBeNull();
+	});
+
+	it("surfaces write failures from the injected file writer", async () => {
+		const deps = createDeps({
+			writeFile: vi.fn(async () => {
+				throw new Error("disk full");
+			}),
+		});
+
+		await expect(
+			runReportCommand(["--json", "--out", "report.json"], deps),
+		).rejects.toThrow("disk full");
+	});
+
+	it("reports codex-unavailable probe failures via forecast.probeErrors without leaking raw detail", async () => {
+		const deps = createDeps({
+			loadAccounts: vi.fn(async () =>
+				createStorage([
+					{
+						email: "one@example.com",
+						accountId: "acc-report-1",
+						refreshToken: "refresh-token-1",
+						accessToken: "access-token-1",
+						expiresAt: Date.now() + 600_000,
+						addedAt: 1,
+						lastUsed: 1,
+						enabled: true,
+					},
+				]),
+			),
+			hasUsableAccessToken: vi.fn(() => true),
+			fetchCodexQuotaSnapshot: vi.fn(async () => {
+				throw new CodexUnavailableError(
+					"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.",
+				);
+			}),
+		});
+
+		const result = await runReportCommand(["--json", "--live"], deps);
+
+		expect(result).toBe(0);
+		const jsonOutput = JSON.parse(
+			(deps.logInfo as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] ?? "{}",
+		) as { forecast: { probeErrors: string[] } };
+		expect(
+			jsonOutput.forecast.probeErrors.some((e) =>
+				e.includes(CODEX_UNAVAILABLE_PROBE_NOTE),
+			),
+		).toBe(true);
+		expect(
+			jsonOutput.forecast.probeErrors.some((e) =>
+				e.includes("is not supported when using Codex"),
+			),
+		).toBe(false);
+	});
+});

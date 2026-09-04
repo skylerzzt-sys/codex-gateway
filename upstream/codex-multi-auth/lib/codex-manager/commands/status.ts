@@ -1,0 +1,377 @@
+import {
+	AUTH_INVALIDATION_MARKER,
+	formatAccountLabel,
+	formatCooldown,
+	formatWaitTime,
+	formatWorkspaceLines,
+} from "../../accounts.js";
+import {
+	evaluateForecastAccounts,
+	recommendForecastAccount,
+} from "../../forecast.js";
+import type { ModelFamily } from "../../prompts/codex.js";
+import {
+	findQuotaCacheEntryForAccount,
+	isQuotaCacheEntryExhausted,
+} from "../../quota-readiness.js";
+import type { QuotaCacheData } from "../../quota-cache.js";
+import type { AppBindRouterStatus } from "../../runtime/app-bind.js";
+import {
+	resolveAccountCurrentMarkers,
+	resolveRuntimeCurrentAccount,
+	type RuntimeAccountSignal,
+} from "../../runtime/runtime-current-account.js";
+import { isRateLimitedMarker } from "../rate-limit-markers.js";
+import type { RuntimeObservabilitySnapshot } from "../../runtime/runtime-observability.js";
+import type { AccountStorageV3, StorageHealthSummary } from "../../storage.js";
+
+type LoadedStorage = AccountStorageV3 | null;
+type RestoreReason = "empty-storage" | "intentional-reset" | "missing-storage";
+
+export interface StatusCommandDeps {
+	setStoragePath: (path: string | null) => void;
+	getStoragePath: () => string | null;
+	loadAccounts: () => Promise<LoadedStorage>;
+	resolveActiveIndex: (
+		storage: AccountStorageV3,
+		family?: ModelFamily,
+	) => number;
+	formatRateLimitEntry: (
+		account: AccountStorageV3["accounts"][number],
+		now: number,
+		family: ModelFamily,
+	) => string | null;
+	loadRuntimeObservabilitySnapshot?: () => Promise<RuntimeObservabilitySnapshot | null>;
+	loadAppBindStatus?: () => Promise<AppBindRouterStatus | null>;
+	loadAppHelperStatus?: () => RuntimeAccountSignal | null;
+	loadQuotaCache?: () => Promise<QuotaCacheData | null>;
+	inspectStorageHealth?: () => Promise<StorageHealthSummary>;
+	getNow?: () => number;
+	logInfo?: (message: string) => void;
+	/** When true, emit a single machine-readable JSON object instead of text (cli-manager-03). */
+	json?: boolean;
+}
+
+function isRestoreReason(value: unknown): value is RestoreReason {
+	return (
+		value === "empty-storage" ||
+		value === "intentional-reset" ||
+		value === "missing-storage"
+	);
+}
+
+function readRestoreReason(storage: AccountStorageV3): RestoreReason | undefined {
+	if (!("restoreReason" in storage)) return undefined;
+	return isRestoreReason(storage.restoreReason)
+		? storage.restoreReason
+		: undefined;
+}
+
+/**
+ * Build the status marker list for one account (cli-manager-03).
+ *
+ * The json and text paths previously rebuilt this identical sequence
+ * independently, so adding a marker to one branch silently diverged the other.
+ * Both paths now call this single builder. Order matters (current → disabled →
+ * rate-limited → 429-from-quota → quota-exhausted → cooldown) and is preserved.
+ */
+function buildAccountMarkers(
+	account: AccountStorageV3["accounts"][number],
+	index: number,
+	activeIndex: number,
+	runtimeCurrent: ReturnType<typeof resolveRuntimeCurrentAccount>,
+	now: number,
+	quotaCache: QuotaCacheData | null,
+	allAccounts: AccountStorageV3["accounts"],
+	formatRateLimitEntry: StatusCommandDeps["formatRateLimitEntry"],
+): string[] {
+	const markers: string[] = [];
+	markers.push(...resolveAccountCurrentMarkers(index, activeIndex, runtimeCurrent));
+	if (account.enabled === false) markers.push("disabled");
+	if (
+		typeof account.authInvalidatedAt === "number" &&
+		Number.isFinite(account.authInvalidatedAt)
+	) {
+		markers.push(AUTH_INVALIDATION_MARKER);
+	}
+	if (formatRateLimitEntry(account, now, "codex")) markers.push("rate-limited");
+	const quotaEntry = findQuotaCacheEntryForAccount(quotaCache, account, allAccounts);
+	if (quotaEntry?.status === 429 && !markers.some(isRateLimitedMarker)) {
+		markers.push("rate-limited");
+	}
+	if (isQuotaCacheEntryExhausted(quotaEntry, now)) markers.push("quota-exhausted");
+	const cooldown = formatCooldown(account, now);
+	if (cooldown) markers.push(`cooldown:${cooldown}`);
+	return markers;
+}
+
+function formatRuntimeLastAccount(
+	runtimeSnapshot: RuntimeObservabilitySnapshot,
+): string | null {
+	if (
+		runtimeSnapshot.lastAccountLabel &&
+		!runtimeSnapshot.lastAccountLabel.includes("@")
+	) {
+		return runtimeSnapshot.lastAccountLabel;
+	}
+	if (runtimeSnapshot.lastAccountId) {
+		return typeof runtimeSnapshot.lastAccountIndex === "number"
+			? `Account ${runtimeSnapshot.lastAccountIndex + 1} (${runtimeSnapshot.lastAccountId})`
+			: runtimeSnapshot.lastAccountId;
+	}
+	if (typeof runtimeSnapshot.lastAccountIndex === "number") {
+		return `Account ${runtimeSnapshot.lastAccountIndex + 1}`;
+	}
+	return null;
+}
+
+export async function runStatusCommand(
+	deps: StatusCommandDeps,
+): Promise<number> {
+	deps.setStoragePath(null);
+	const storage = await deps.loadAccounts();
+	const path = deps.getStoragePath();
+	const storageHealth = await deps.inspectStorageHealth?.();
+	const logInfo = deps.logInfo ?? console.log;
+	if (!storage || storage.accounts.length === 0) {
+		const restoreReason = storage ? readRestoreReason(storage) : undefined;
+		const effectiveState: StorageHealthSummary["state"] | undefined =
+			restoreReason === "intentional-reset"
+				? "intentional-reset"
+				: storageHealth?.state ??
+					(restoreReason === "empty-storage" ||
+					restoreReason === "missing-storage"
+						? "empty"
+						: undefined);
+		if (deps.json) {
+			logInfo(
+				JSON.stringify(
+					{
+						storagePath: path,
+						storageHealth: effectiveState ?? null,
+						accountCount: 0,
+						// Emit the same keys the populated branch does (as null) so a
+						// --json consumer sees one stable shape regardless of account count.
+						activeIndex: null,
+						pinnedAccountIndex: null,
+						recommendedIndex: null,
+						recommendationReason: null,
+						runtimeInUseIndex: null,
+						accounts: [],
+					},
+					null,
+					2,
+				),
+			);
+			return 0;
+		}
+		logInfo(
+			effectiveState === "intentional-reset"
+				? "No accounts configured. Storage was intentionally reset."
+				: effectiveState === "recoverable"
+					? "No accounts configured. Recovery artifacts are available."
+					: effectiveState === "corrupt"
+						? "No accounts configured. Storage appears corrupted."
+						: "No accounts configured.",
+		);
+		logInfo(`Storage: ${path}`);
+		if (effectiveState) {
+			logInfo(`Storage health: ${effectiveState}`);
+		}
+		return 0;
+	}
+
+	const now = deps.getNow?.() ?? Date.now();
+	const activeIndex = deps.resolveActiveIndex(storage, "codex");
+	const forecastResults = evaluateForecastAccounts(
+		storage.accounts.map((account, index) => ({
+			index,
+			account,
+			isCurrent: index === activeIndex,
+			now,
+		})),
+	);
+	const recommendation = recommendForecastAccount(forecastResults);
+	if (!deps.json) {
+		logInfo(`Accounts (${storage.accounts.length})`);
+		logInfo(`Storage: ${path}`);
+		if (recommendation.recommendedIndex !== null) {
+			logInfo(
+				`Selection reason: account ${recommendation.recommendedIndex + 1} (${recommendation.reason})`,
+			);
+		}
+		if (storageHealth) {
+			logInfo(`Storage health: ${storageHealth.state}`);
+		}
+	}
+	const appHelperStatus = deps.loadAppHelperStatus?.() ?? null;
+	const [runtimeSnapshot, appBindStatus, quotaCache] = await Promise.all([
+		deps.loadRuntimeObservabilitySnapshot?.() ?? Promise.resolve(null),
+		deps.loadAppBindStatus?.() ?? Promise.resolve(null),
+		deps.loadQuotaCache?.() ?? Promise.resolve(null),
+	]);
+	const runtimeCurrent = resolveRuntimeCurrentAccount(
+		storage,
+		{
+			runtimeSnapshot,
+			appBindStatus,
+			appHelperStatus,
+		},
+		{ now },
+	);
+
+	// cli-manager-03: machine-readable output for status/list. Build a single
+	// object from the same data the text path renders, then emit and return.
+	if (deps.json) {
+		const accounts = storage.accounts.map((account, i) => {
+			const markers = buildAccountMarkers(
+				account,
+				i,
+				activeIndex,
+				runtimeCurrent,
+				now,
+				quotaCache,
+				storage.accounts,
+				deps.formatRateLimitEntry,
+			);
+			return {
+				index: i,
+				label: formatAccountLabel(account, i),
+				enabled: account.enabled !== false,
+				current: i === activeIndex,
+				markers,
+				lastUsed:
+					typeof account.lastUsed === "number" && account.lastUsed > 0
+						? account.lastUsed
+						: null,
+				reason: forecastResults[i]?.reasons[0] ?? null,
+			};
+		});
+		logInfo(
+			JSON.stringify(
+				{
+					storagePath: path,
+					storageHealth: storageHealth?.state ?? null,
+					accountCount: storage.accounts.length,
+					activeIndex,
+					pinnedAccountIndex:
+						typeof storage.pinnedAccountIndex === "number"
+							? storage.pinnedAccountIndex
+							: null,
+					recommendedIndex: recommendation.recommendedIndex,
+					recommendationReason: recommendation.reason,
+					runtimeInUseIndex: runtimeCurrent ? runtimeCurrent.index : null,
+					accounts,
+				},
+				null,
+				2,
+			),
+		);
+		return 0;
+	}
+
+	if (runtimeSnapshot) {
+		const runtimeMetrics = runtimeSnapshot.runtimeMetrics;
+		const poolCooldown =
+			typeof runtimeSnapshot.poolExhaustionCooldownUntil === "number" &&
+			runtimeSnapshot.poolExhaustionCooldownUntil > now
+				? formatWaitTime(runtimeSnapshot.poolExhaustionCooldownUntil - now)
+				: null;
+		const serverCooldown =
+			typeof runtimeSnapshot.serverBurstCooldownUntil === "number" &&
+			runtimeSnapshot.serverBurstCooldownUntil > now
+				? formatWaitTime(runtimeSnapshot.serverBurstCooldownUntil - now)
+				: null;
+		logInfo(
+			`Runtime: responses=${runtimeSnapshot.responsesRequests}, refresh=${runtimeSnapshot.authRefreshRequests}, probes=${runtimeSnapshot.diagnosticProbeRequests}, budgetExhaustions=${runtimeMetrics.requestAttemptBudgetExhaustions}`,
+		);
+		const lastRuntimeAccount = formatRuntimeLastAccount(runtimeSnapshot);
+		if (lastRuntimeAccount) {
+			logInfo(`Last runtime account: ${lastRuntimeAccount}`);
+		}
+		if (poolCooldown || serverCooldown) {
+			logInfo(
+				`Cooldowns: pool=${poolCooldown ?? "none"}, server-burst=${serverCooldown ?? "none"}`,
+			);
+		}
+		if (runtimeSnapshot.currentRequestId) {
+			logInfo(`Last request trace: ${runtimeSnapshot.currentRequestId}`);
+		}
+	}
+	if (runtimeCurrent) {
+		logInfo(
+			`Runtime in use: account ${runtimeCurrent.index + 1} (${runtimeCurrent.source})`,
+		);
+	}
+	const pinnedAccountIndex = storage.pinnedAccountIndex;
+	if (typeof pinnedAccountIndex === "number") {
+		if (
+			!Number.isInteger(pinnedAccountIndex) ||
+			pinnedAccountIndex < 0 ||
+			pinnedAccountIndex >= storage.accounts.length
+		) {
+			logInfo(
+				`Pinned: invalid account index ${pinnedAccountIndex}; run codex-multi-auth unpin`,
+			);
+		} else {
+			logInfo(`Pinned: account ${pinnedAccountIndex + 1} (set by switch)`);
+			if (runtimeCurrent && runtimeCurrent.index !== pinnedAccountIndex) {
+				logInfo(
+					`  warning: runtime currently using account ${runtimeCurrent.index + 1} but pin requests account ${pinnedAccountIndex + 1}; the proxy will pick up the pin on the next request.`,
+				);
+			}
+		}
+	}
+	logInfo("");
+
+	for (let i = 0; i < storage.accounts.length; i += 1) {
+		const account = storage.accounts[i];
+		if (!account) continue;
+		const label = formatAccountLabel(account, i);
+		const markers = buildAccountMarkers(
+			account,
+			i,
+			activeIndex,
+			runtimeCurrent,
+			now,
+			quotaCache,
+			storage.accounts,
+			deps.formatRateLimitEntry,
+		);
+		const markerLabel = markers.length > 0 ? ` [${markers.join(", ")}]` : "";
+		const lastUsed =
+			typeof account.lastUsed === "number" && account.lastUsed > 0
+				? `used ${formatWaitTime(now - account.lastUsed)} ago`
+				: "never used";
+		logInfo(`${i + 1}. ${label}${markerLabel} ${lastUsed}`);
+		const primaryReason = forecastResults[i]?.reasons[0];
+		if (primaryReason) {
+			logInfo(`   reason: ${primaryReason}`);
+		}
+		// Surface every workspace a same-email account can rotate between, so
+		// personal Plus vs business/team stay visible at once (issue #491).
+		if ((account.workspaces?.length ?? 0) > 1) {
+			logInfo("   workspaces:");
+			for (const workspaceLine of formatWorkspaceLines(account, "     ")) {
+				logInfo(workspaceLine);
+			}
+		}
+	}
+
+	return 0;
+}
+
+export interface FeaturesCommandDeps {
+	implementedFeatures: ReadonlyArray<{ id: number; name: string }>;
+	logInfo?: (message: string) => void;
+}
+
+export function runFeaturesCommand(deps: FeaturesCommandDeps): number {
+	const logInfo = deps.logInfo ?? console.log;
+	logInfo(`Implemented features (${deps.implementedFeatures.length})`);
+	logInfo("");
+	for (const feature of deps.implementedFeatures) {
+		logInfo(`${feature.id}. ${feature.name}`);
+	}
+	return 0;
+}

@@ -1,0 +1,11 @@
+# Keep repository language stats focused on authored TypeScript sources.
+*.ts linguist-detectable
+*.js -linguist-detectable
+*.mjs -linguist-detectable
+*.sh -linguist-detectable
+*.html -linguist-detectable
+
+# The generated schema is byte-compared against a fresh render in
+# test/config-schema-generated.test.ts; pin LF so Windows autocrlf
+# checkouts do not produce spurious drift failures.
+config/schema/config.schema.json text eol=lf

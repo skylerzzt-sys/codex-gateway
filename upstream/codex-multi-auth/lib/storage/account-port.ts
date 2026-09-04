@@ -1,0 +1,116 @@
+import type { AccountStorageV3 } from "./public-types.js";
+
+export async function exportAccountsSnapshot(params: {
+	resolvedPath: string;
+	force: boolean;
+	currentStoragePath: string;
+	transactionState:
+		| {
+				active: boolean;
+				storagePath: string;
+				snapshot: AccountStorageV3 | null;
+		  }
+		| undefined;
+	readCurrentStorageUnlocked: () => Promise<AccountStorageV3 | null>;
+	readCurrentStorage: () => Promise<AccountStorageV3 | null>;
+	exportAccountsToFile: (args: {
+		resolvedPath: string;
+		force: boolean;
+		storage: AccountStorageV3 | null;
+		beforeCommit?: (resolvedPath: string) => Promise<void> | void;
+		logInfo: (message: string, details: Record<string, unknown>) => void;
+	}) => Promise<void>;
+	beforeCommit?: (resolvedPath: string) => Promise<void> | void;
+	logInfo: (message: string, details: Record<string, unknown>) => void;
+}): Promise<void> {
+	const storage =
+		params.transactionState?.active &&
+		params.transactionState.storagePath === params.currentStoragePath
+			? params.transactionState.snapshot
+			: params.transactionState?.active
+				? await params.readCurrentStorageUnlocked()
+				: await params.readCurrentStorage();
+
+	await params.exportAccountsToFile({
+		resolvedPath: params.resolvedPath,
+		force: params.force,
+		storage,
+		beforeCommit: params.beforeCommit,
+		logInfo: params.logInfo,
+	});
+}
+
+export async function importAccountsSnapshot(params: {
+	resolvedPath: string;
+	readImportFile: (args: {
+		resolvedPath: string;
+		normalizeAccountStorage: (value: unknown) => AccountStorageV3 | null;
+	}) => Promise<AccountStorageV3>;
+	normalizeAccountStorage: (value: unknown) => AccountStorageV3 | null;
+	withAccountStorageTransaction: <T>(
+		handler: (
+			current: AccountStorageV3 | null,
+			persist: (storage: AccountStorageV3) => Promise<void>,
+		) => Promise<T>,
+	) => Promise<T>;
+	mergeImportedAccounts: (args: {
+		existing: AccountStorageV3 | null;
+		imported: AccountStorageV3;
+		maxAccounts: number;
+		deduplicateAccounts: (
+			accounts: AccountStorageV3["accounts"],
+		) => AccountStorageV3["accounts"];
+		findMatchingAccountIndex: (
+			accounts: AccountStorageV3["accounts"],
+			candidate: AccountStorageV3["accounts"][number],
+		) => number | undefined;
+	}) => {
+		newStorage: AccountStorageV3;
+		imported: number;
+		total: number;
+		skipped: number;
+	};
+	maxAccounts: number;
+	deduplicateAccounts: (
+		accounts: AccountStorageV3["accounts"],
+	) => AccountStorageV3["accounts"];
+	// Forwarded to `mergeImportedAccounts` so it can re-resolve the manual pin by
+	// identity after dedupe reorders the merged account list.
+	findMatchingAccountIndex: (
+		accounts: AccountStorageV3["accounts"],
+		candidate: AccountStorageV3["accounts"][number],
+	) => number | undefined;
+	logInfo: (message: string, details: Record<string, unknown>) => void;
+}): Promise<{ imported: number; total: number; skipped: number }> {
+	const normalized = await params.readImportFile({
+		resolvedPath: params.resolvedPath,
+		normalizeAccountStorage: params.normalizeAccountStorage,
+	});
+
+	const result = await params.withAccountStorageTransaction(
+		async (existing, persist) => {
+			const merged = params.mergeImportedAccounts({
+				existing,
+				imported: normalized,
+				maxAccounts: params.maxAccounts,
+				deduplicateAccounts: params.deduplicateAccounts,
+				findMatchingAccountIndex: params.findMatchingAccountIndex,
+			});
+			await persist(merged.newStorage);
+			return {
+				imported: merged.imported,
+				total: merged.total,
+				skipped: merged.skipped,
+			};
+		},
+	);
+
+	params.logInfo("Imported accounts", {
+		path: params.resolvedPath,
+		imported: result.imported,
+		skipped: result.skipped,
+		total: result.total,
+	});
+	return result;
+}
+

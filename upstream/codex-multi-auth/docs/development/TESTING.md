@@ -1,0 +1,161 @@
+# Testing Guide
+
+Testing strategy and release gate for runtime, CLI, and docs consistency.
+
+* * *
+
+## Test Stack
+
+| Layer | Tooling |
+| --- | --- |
+| Unit/integration tests | Vitest (`test/**/*.test.ts`) |
+| Type checks | TypeScript (`tsc --noEmit`) |
+| Linting | ESLint |
+| Coverage | Vitest V8 coverage |
+
+Coverage thresholds in `vitest.config.ts`: statements/branches/functions/lines >= `80`.
+
+* * *
+
+## Core Commands
+
+```bash
+npm run typecheck
+npm run lint
+npm test
+npm run build
+```
+
+Optional:
+
+```bash
+npm run test:watch
+npm run test:coverage
+npm test -- test/documentation.test.ts
+npm test -- test/runtime-rotation-proxy.test.ts test/codex-bin-wrapper.test.ts
+npm run test:model-matrix:smoke
+npm run bench:edit-formats:smoke
+```
+
+* * *
+
+## Recommended Local Gate Before PR
+
+1. `npm run typecheck`
+2. `npm run lint`
+3. `npm test`
+4. `npm run build`
+5. run docs command checks for newly documented command paths
+
+* * *
+
+## Auth/Account Change Test Matrix
+
+| Area | Minimum checks |
+| --- | --- |
+| Login flow | `codex-multi-auth login` completes and stores real account data |
+| Switching flow | `codex-multi-auth switch <index>` updates active account behavior |
+| Health operations | `check`, `forecast`, `fix`, `doctor`, `report` produce sane output |
+| Storage durability | backup/WAL recovery remains valid |
+| CLI state sync | active account sync with Codex CLI files |
+| Runtime rotation | localhost proxy startup, request forwarding, account rotation, shadow-home sync-back, app-helper status |
+| Local governance | usage ledger, account policies, routing profiles, budget guards, runtime policy, monitor aggregation |
+| Local bridge | loopback-only health/models/responses forwarding, bearer token checks, integration snippets |
+| Packaged app bind | config backup/restore, router startup state, startup entry cleanup |
+| Live updates | account changes picked up without restart |
+| Concurrency race safety | refresh/write races covered by deterministic tests |
+| Windows transient FS handling | retry behavior for `EBUSY`/`EPERM` paths |
+
+* * *
+
+## Manual Smoke Pack
+
+```bash
+codex-multi-auth login
+codex-multi-auth list
+codex-multi-auth check
+codex-multi-auth forecast --live
+codex-multi-auth fix --dry-run
+codex-multi-auth doctor --fix --dry-run
+codex-multi-auth report --live --json
+codex-multi-auth usage --since 24h --by outcome
+codex-multi-auth monitor --json
+codex-multi-auth bridge token create --label smoke
+codex-multi-auth integrations --kind python
+```
+
+Optional plugin-host smoke:
+
+```bash
+<run-your-host-runtime-smoke-command>
+```
+
+Runtime rotation smoke:
+
+```bash
+codex-multi-auth rotation status
+codex-multi-auth-codex exec "say hello" --model gpt-5.5
+```
+
+For live smoke evidence, confirm the official Codex startup/status output uses provider `codex-multi-auth-runtime-proxy` and a localhost Responses URL. Account/quota failures after that point can still prove routing if the provider and localhost path are visible.
+
+* * *
+
+## Failure-Mode Scenarios
+
+| Scenario | Expected behavior |
+| --- | --- |
+| OAuth callback port conflict | clean error and retry path |
+| Invalid/expired refresh token | account flagged/disabled by policy tools |
+| All accounts rate-limited | forecast/report show wait and recommendation |
+| Runtime rotation pool exhausted | proxy returns `codex_runtime_rotation_pool_exhausted` with `codex-multi-auth rotation status` hint |
+| Runtime proxy upstream compression | decoded client bytes are not paired with stale `content-encoding` |
+| Shadow-home sync owner write failure | orphaned lock is removed or retried so later sync-back is not silently skipped |
+| Storage write error | `StorageError` has actionable hint |
+| Unsupported model | policy fallback or strict failure as configured |
+| Stream stalls | stream failover logic engages by policy |
+
+* * *
+
+## Refactor Guardrail Checklist
+
+Before approving a large runtime, manager, or storage refactor, run the narrow suites that protect the highest-risk invariants:
+
+```bash
+npm test -- test/index.test.ts test/index-retry.test.ts
+npm test -- test/runtime-rotation-proxy.test.ts test/runtime-rotation-proxy-safe-equal.test.ts test/codex-bin-wrapper.test.ts
+npm test -- test/codex-manager-cli.test.ts
+npm test -- test/storage.test.ts test/storage-async.test.ts test/storage-recovery-paths.test.ts test/paths.test.ts
+```
+
+Key guardrails to watch:
+
+- request invariants stay locked: `stream: true`, `store: false`, and `reasoning.encrypted_content`
+- runtime rotation stays default-on, loopback-only, and authenticated with local client keys
+- shadow-home cleanup and sync-back remain safe under Windows-style `EBUSY`/`EPERM` failures
+- storage failures still produce actionable `StorageError` hints
+- linked-worktree and forged-path protections remain covered by `test/paths.test.ts`
+
+Runbooks for common maintenance tasks:
+
+- [RUNBOOK_ADD_AUTH_COMMAND.md](RUNBOOK_ADD_AUTH_COMMAND.md)
+- [RUNBOOK_ADD_CONFIG_FIELD.md](RUNBOOK_ADD_CONFIG_FIELD.md)
+- [RUNBOOK_CHANGE_ROUTING_POLICY.md](RUNBOOK_CHANGE_ROUTING_POLICY.md)
+
+* * *
+
+## Docs QA (when docs change)
+
+1. Verify every command snippet is runnable.
+2. Cross-check path references against runtime modules.
+3. Confirm cross-links are valid.
+4. Keep feature matrix in sync with implemented features.
+
+* * *
+
+## Related
+
+- [ARCHITECTURE.md](ARCHITECTURE.md)
+- [CONFIG_FIELDS.md](CONFIG_FIELDS.md)
+- [../DOCUMENTATION.md](../DOCUMENTATION.md)
+- [../benchmarks/code-edit-format-benchmark.md](../benchmarks/code-edit-format-benchmark.md)

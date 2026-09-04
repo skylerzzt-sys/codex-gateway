@@ -1,0 +1,276 @@
+#!/usr/bin/env node
+
+// @ts-check
+
+import { existsSync } from "node:fs";
+import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+	normalizePluginList,
+	renameWithRetry,
+	resolveInstallPaths,
+	withFileOperationRetry,
+} from "./install-codex-auth-utils.js";
+
+const PLUGIN_NAME = "codex-multi-auth";
+
+const args = new Set(process.argv.slice(2));
+
+if (args.has("--help") || args.has("-h")) {
+	console.log(
+		`Usage: ${PLUGIN_NAME} [--modern|--legacy] [--dry-run] [--no-cache-clear]\n\n` +
+			"Default behavior:\n" +
+			"  - Installs/updates global config at ~/.config/Codex/Codex.json\n" +
+			"  - Uses modern config (variants) by default\n" +
+			"  - Ensures plugin is unpinned (latest)\n" +
+			"  - Clears Codex plugin cache\n\n" +
+			"Options:\n" +
+			"  --modern           Force modern config (default)\n" +
+			"  --legacy           Use legacy config (older Codex versions)\n" +
+			"  --dry-run          Show actions without writing\n" +
+			"  --no-cache-clear   Skip clearing Codex cache\n",
+	);
+	process.exit(0);
+}
+
+const useLegacy = args.has("--legacy");
+const useModern = args.has("--modern") || !useLegacy;
+const dryRun = args.has("--dry-run");
+const skipCacheClear = args.has("--no-cache-clear");
+
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(scriptDir, "..");
+const templatePath = join(
+	repoRoot,
+	"config",
+	useLegacy ? "codex-legacy.json" : "codex-modern.json",
+);
+
+const installPaths = resolveInstallPaths();
+const {
+	configDir,
+	configPath,
+	cacheNodeModules,
+	cacheBunLock,
+	cachePackageJson,
+} = installPaths;
+
+/** @param {string} message */
+function log(message) {
+	console.log(message);
+}
+
+/** @param {unknown} obj */
+function formatJson(obj) {
+	return `${JSON.stringify(obj, null, 2)}\n`;
+}
+
+/** @param {string} filePath */
+async function readJson(filePath) {
+	const content = await readFile(filePath, "utf-8");
+	return /** @type {any} */ (JSON.parse(content));
+}
+
+/** @param {string} filePath @param {unknown} value */
+async function writeJsonAtomic(filePath, value) {
+	const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random()
+		.toString(36)
+		.slice(2, 8)}`;
+	const content = formatJson(value);
+	try {
+		await withFileOperationRetry(() => writeFile(tempPath, content, "utf-8"));
+		await renameWithRetry(tempPath, filePath, { log });
+	} finally {
+		if (existsSync(tempPath)) {
+			try {
+				await withFileOperationRetry(() => rm(tempPath, { force: true }));
+			} catch (error) {
+				log(`Warning: Could not remove temporary file ${tempPath} (${error}).`);
+			}
+		}
+	}
+}
+
+/** @param {string} sourcePath */
+async function backupConfig(sourcePath) {
+	const timestamp = new Date()
+		.toISOString()
+		.replace(/[:.]/g, "-")
+		.replace("T", "_")
+		.replace("Z", "");
+	const nonce = `${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+	const backupPath = `${sourcePath}.bak-${timestamp}-${nonce}`;
+	if (!dryRun) {
+		await copyFile(sourcePath, backupPath);
+	}
+	return backupPath;
+}
+
+async function removePluginFromCachePackage() {
+	if (!existsSync(cachePackageJson)) {
+		return;
+	}
+
+	/** @type {any} */
+	let cacheData;
+	try {
+		cacheData = await readJson(cachePackageJson);
+	} catch (error) {
+		log(`Warning: Could not parse ${cachePackageJson} (${error}). Skipping.`);
+		return;
+	}
+
+	const sections = [
+		"dependencies",
+		"devDependencies",
+		"peerDependencies",
+		"optionalDependencies",
+	];
+
+	let changed = false;
+	for (const section of sections) {
+		const deps = cacheData?.[section];
+		if (deps && typeof deps === "object" && PLUGIN_NAME in deps) {
+			delete deps[PLUGIN_NAME];
+			changed = true;
+		}
+	}
+
+	if (!changed) {
+		return;
+	}
+
+	if (dryRun) {
+		log(`[dry-run] Would update ${cachePackageJson} to remove ${PLUGIN_NAME}`);
+		return;
+	}
+
+	await writeJsonAtomic(cachePackageJson, cacheData);
+}
+
+async function clearCache() {
+	if (skipCacheClear) {
+		log("Skipping cache clear (--no-cache-clear).");
+		return;
+	}
+
+	if (dryRun) {
+		log(`[dry-run] Would remove ${cacheNodeModules}`);
+		log(`[dry-run] Would remove ${cacheBunLock}`);
+	} else {
+		try {
+			await withFileOperationRetry(() =>
+				rm(cacheNodeModules, { recursive: true, force: true }),
+			);
+			await withFileOperationRetry(() => rm(cacheBunLock, { force: true }));
+		} catch (error) {
+			log(
+				`Warning: Could not fully clear cache (${error instanceof Error ? error.message : String(error)}). You may need to restart Codex.`,
+			);
+		}
+	}
+
+	await removePluginFromCachePackage();
+}
+
+async function main() {
+	if (!existsSync(templatePath)) {
+		throw new Error(`Config template not found at ${templatePath}`);
+	}
+
+	const template = await readJson(templatePath);
+	template.plugin = [PLUGIN_NAME];
+
+	let nextConfig = template;
+	if (existsSync(configPath)) {
+		const backupPath = await backupConfig(configPath);
+		log(
+			`${dryRun ? "[dry-run] Would create backup" : "Backup created"}: ${backupPath}`,
+		);
+
+		try {
+			const existing = await readJson(configPath);
+			const merged = { ...existing };
+			merged.plugin = normalizePluginList(existing.plugin);
+			const provider =
+				existing.provider && typeof existing.provider === "object"
+					? { ...existing.provider }
+					: {};
+			const existingOpenAi =
+				provider.openai && typeof provider.openai === "object"
+					? provider.openai
+					: {};
+			const templateOpenAi =
+				template.provider &&
+				typeof template.provider === "object" &&
+				template.provider.openai &&
+				typeof template.provider.openai === "object"
+					? template.provider.openai
+					: {};
+			// Existing top-level openai settings (e.g. `options`) win so user
+			// customizations survive an upgrade. The `models` maps, however, are
+			// merged at the model-id level: newly shipped template models (e.g. the
+			// GPT-5.6 tiers) appear on upgrade instead of being shadowed wholesale by
+			// the user's saved model list (issue #626). Per id the user's existing
+			// entry still wins, so custom tweaks to a known model are preserved.
+			provider.openai = { ...templateOpenAi, ...existingOpenAi };
+			const templateModels =
+				templateOpenAi.models && typeof templateOpenAi.models === "object"
+					? templateOpenAi.models
+					: {};
+			const existingModels =
+				existingOpenAi.models && typeof existingOpenAi.models === "object"
+					? existingOpenAi.models
+					: {};
+			const mergedModels = { ...templateModels, ...existingModels };
+			if (Object.keys(mergedModels).length > 0) {
+				provider.openai.models = mergedModels;
+			}
+			merged.provider = provider;
+			nextConfig = merged;
+		} catch (error) {
+			log(
+				`Warning: Could not parse existing config (${error}). Replacing with template.`,
+			);
+			nextConfig = template;
+		}
+	} else {
+		log("No existing config found. Creating new global config.");
+	}
+
+	if (dryRun) {
+		log(
+			`[dry-run] Would write ${configPath} using ${useLegacy ? "legacy" : "modern"} config`,
+		);
+	} else {
+		await mkdir(configDir, { recursive: true });
+		await writeJsonAtomic(configPath, nextConfig);
+		log(`Wrote ${configPath} (${useLegacy ? "legacy" : "modern"} config)`);
+	}
+
+	await clearCache();
+
+	log("\nDone. Restart Codex to (re)install the plugin.");
+	log("Example: Codex");
+	if (useLegacy) {
+		log("Note: Legacy config requires Codex v1.0.209 or older.");
+	}
+}
+
+const isDirectRun = (() => {
+	try {
+		return resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url);
+	} catch {
+		return false;
+	}
+})();
+
+if (isDirectRun) {
+	main().catch((error) => {
+		console.error(
+			`Installer failed: ${error instanceof Error ? error.message : error}`,
+		);
+		process.exit(1);
+	});
+}

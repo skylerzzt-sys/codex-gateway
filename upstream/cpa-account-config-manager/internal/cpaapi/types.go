@@ -1,0 +1,579 @@
+package cpaapi
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+const (
+	ABIVersion          uint32 = 1
+	LegacySchemaVersion uint32 = 1
+	SchemaVersion       uint32 = 2
+)
+
+const (
+	MethodPluginRegister         = "plugin.register"
+	MethodPluginReconfigure      = "plugin.reconfigure"
+	MethodManagementRegister     = "management.register"
+	MethodManagementHandle       = "management.handle"
+	MethodSchedulerPick          = "scheduler.pick"
+	MethodRequestInterceptBefore = "request.intercept_before"
+	MethodRequestInterceptAfter  = "request.intercept_after"
+	MethodRequestComplete        = "request.complete"
+	MethodUsageHandle            = "usage.handle"
+	MethodAuthIdentifier         = "auth.identifier"
+	MethodAuthParse              = "auth.parse"
+	MethodAuthLoginStart         = "auth.login.start"
+	MethodAuthLoginPoll          = "auth.login.poll"
+	MethodAuthRefresh            = "auth.refresh"
+	MethodModelStatic            = "model.static"
+	MethodModelForAuth           = "model.for_auth"
+	MethodExecutorIdentifier     = "executor.identifier"
+	MethodExecutorExecute        = "executor.execute"
+	MethodExecutorExecuteStream  = "executor.execute_stream"
+	MethodExecutorCountTokens    = "executor.count_tokens"
+	MethodExecutorHTTPRequest    = "executor.http_request"
+	MethodHostHTTPDo             = "host.http.do"
+	MethodHostHTTPDoStream       = "host.http.do_stream"
+	MethodHostHTTPStreamRead     = "host.http.stream_read"
+	MethodHostHTTPStreamClose    = "host.http.stream_close"
+	MethodHostStreamEmit         = "host.stream.emit"
+	MethodHostStreamClose        = "host.stream.close"
+	MethodHostAuthList           = "host.auth.list"
+	MethodHostAuthGet            = "host.auth.get"
+	MethodHostAuthGetRuntime     = "host.auth.get_runtime"
+	MethodHostAuthSave           = "host.auth.save"
+	MethodHostAuthRefresh        = "host.auth.refresh"
+)
+
+type Metadata struct {
+	Name             string
+	Version          string
+	Author           string
+	GitHubRepository string
+	Logo             string
+	ConfigFields     []ConfigField
+}
+
+type ConfigFieldType string
+
+const (
+	ConfigFieldTypeString  ConfigFieldType = "string"
+	ConfigFieldTypeInteger ConfigFieldType = "integer"
+	ConfigFieldTypeBoolean ConfigFieldType = "boolean"
+	ConfigFieldTypeEnum    ConfigFieldType = "enum"
+)
+
+type ConfigField struct {
+	Name        string
+	Type        ConfigFieldType
+	EnumValues  []string
+	Description string
+}
+
+type ManagementRegistrationResponse struct {
+	Routes    []ManagementRoute
+	Resources []ResourceRoute
+}
+
+type ManagementRoute struct {
+	Method      string
+	Path        string
+	Menu        string
+	Description string
+}
+
+type ResourceRoute struct {
+	Path        string
+	Menu        string
+	Description string
+}
+
+type ManagementRequest struct {
+	Method         string
+	Path           string
+	Headers        http.Header
+	Query          url.Values
+	Body           []byte
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type ManagementResponse struct {
+	StatusCode int
+	Headers    http.Header
+	Body       []byte
+}
+
+// SchedulerPickRequest mirrors CLIProxyAPI's scheduler.pick request. The host
+// supplies only candidates that already passed its own eligibility checks.
+type SchedulerPickRequest struct {
+	Plugin     Metadata                 `json:"Plugin"`
+	Provider   string                   `json:"Provider"`
+	Providers  []string                 `json:"Providers"`
+	Model      string                   `json:"Model"`
+	Stream     bool                     `json:"Stream"`
+	Options    SchedulerOptions         `json:"Options"`
+	Candidates []SchedulerAuthCandidate `json:"Candidates"`
+}
+
+type SchedulerOptions struct {
+	Headers  map[string][]string `json:"Headers"`
+	Metadata map[string]any      `json:"Metadata"`
+}
+
+type SchedulerAuthCandidate struct {
+	ID         string            `json:"ID"`
+	Provider   string            `json:"Provider"`
+	Priority   int               `json:"Priority"`
+	Status     string            `json:"Status"`
+	Attributes map[string]string `json:"Attributes"`
+	Metadata   map[string]any    `json:"Metadata"`
+}
+
+type SchedulerPickResponse struct {
+	AuthID          string `json:"AuthID,omitempty"`
+	DelegateBuiltin string `json:"DelegateBuiltin,omitempty"`
+	Handled         bool   `json:"Handled"`
+}
+
+type RequestInterceptRequest struct {
+	RequestID      string         `json:"RequestID"`
+	TraceID        string         `json:"TraceID"`
+	SourceFormat   string         `json:"SourceFormat"`
+	ToFormat       string         `json:"ToFormat"`
+	Model          string         `json:"Model"`
+	RequestedModel string         `json:"RequestedModel"`
+	Stream         bool           `json:"Stream"`
+	Headers        http.Header    `json:"Headers"`
+	Body           []byte         `json:"Body"`
+	Metadata       map[string]any `json:"Metadata"`
+}
+
+type RequestInterceptResponse struct {
+	Headers         http.Header `json:"Headers,omitempty"`
+	Body            []byte      `json:"Body,omitempty"`
+	ClearHeaders    []string    `json:"ClearHeaders,omitempty"`
+	Terminate       bool        `json:"Terminate,omitempty"`
+	StatusCode      int         `json:"StatusCode,omitempty"`
+	ResponseHeaders http.Header `json:"ResponseHeaders,omitempty"`
+	ResponseBody    []byte      `json:"ResponseBody,omitempty"`
+}
+
+type RequestCompletion struct {
+	RequestID      string         `json:"RequestID"`
+	TraceID        string         `json:"TraceID"`
+	SourceFormat   string         `json:"SourceFormat"`
+	Model          string         `json:"Model"`
+	RequestedModel string         `json:"RequestedModel"`
+	Stream         bool           `json:"Stream"`
+	Outcome        string         `json:"Outcome"`
+	StatusCode     int            `json:"StatusCode"`
+	Error          string         `json:"Error"`
+	StartedAt      time.Time      `json:"StartedAt"`
+	CompletedAt    time.Time      `json:"CompletedAt"`
+	Metadata       map[string]any `json:"Metadata"`
+}
+
+type IdentifierResponse struct {
+	Identifier string `json:"identifier"`
+}
+
+type AuthParseRequest struct {
+	Provider string
+	Path     string
+	FileName string
+	RawJSON  []byte
+}
+
+type AuthData struct {
+	Provider         string
+	ID               string
+	FileName         string
+	Label            string
+	Prefix           string
+	ProxyURL         string
+	Disabled         bool
+	StorageJSON      []byte
+	Metadata         map[string]any
+	Attributes       map[string]string
+	NextRefreshAfter time.Time
+}
+
+type AuthParseResponse struct {
+	Handled bool
+	Auth    AuthData
+	Auths   []AuthData
+}
+
+type AuthLoginStartRequest struct {
+	Provider       string
+	BaseURL        string
+	Metadata       map[string]any
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type AuthLoginStartResponse struct {
+	Provider  string
+	URL       string
+	State     string
+	ExpiresAt time.Time
+	Metadata  map[string]any
+}
+
+type AuthLoginPollRequest struct {
+	Provider       string
+	State          string
+	Metadata       map[string]any
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type AuthLoginPollResponse struct {
+	Status  string
+	Message string
+	Auth    AuthData
+	Auths   []AuthData
+}
+
+type AuthRefreshRequest struct {
+	AuthID       string
+	AuthProvider string
+	StorageJSON  []byte
+	Metadata     map[string]any
+	Attributes   map[string]string
+}
+
+type AuthRefreshResponse struct {
+	Auth             AuthData
+	NextRefreshAfter time.Time
+}
+
+type ThinkingSupport struct {
+	Min            int
+	Max            int
+	ZeroAllowed    bool
+	DynamicAllowed bool
+	Levels         []string
+}
+
+type ModelInfo struct {
+	ID                         string
+	Object                     string
+	Created                    int64
+	OwnedBy                    string
+	Type                       string
+	DisplayName                string
+	Name                       string
+	Version                    string
+	Description                string
+	InputTokenLimit            int64
+	OutputTokenLimit           int64
+	SupportedGenerationMethods []string
+	ContextLength              int64
+	MaxCompletionTokens        int64
+	SupportedParameters        []string
+	SupportedInputModalities   []string
+	SupportedOutputModalities  []string
+	Thinking                   *ThinkingSupport
+	UserDefined                bool
+}
+
+type AuthModelRequest struct {
+	AuthID         string
+	AuthProvider   string
+	StorageJSON    []byte
+	Metadata       map[string]any
+	Attributes     map[string]string
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type ModelResponse struct {
+	Provider   string
+	Models     []ModelInfo
+	AuthUpdate AuthData
+}
+
+type ExecutorRequest struct {
+	AuthID          string
+	AuthProvider    string
+	Model           string
+	Format          string
+	Stream          bool
+	Alt             string
+	Headers         http.Header
+	Query           url.Values
+	OriginalRequest []byte
+	SourceFormat    string
+	Payload         []byte
+	Metadata        map[string]any
+	StorageJSON     []byte
+	AuthMetadata    map[string]any
+	AuthAttributes  map[string]string
+	StreamID        string `json:"stream_id,omitempty"`
+	HostCallbackID  string `json:"host_callback_id,omitempty"`
+}
+
+type ExecutorResponse struct {
+	Payload  []byte
+	Headers  http.Header
+	Metadata map[string]any
+}
+
+type ExecutorStreamResponse struct {
+	Headers http.Header           `json:"headers,omitempty"`
+	Chunks  []ExecutorStreamChunk `json:"chunks,omitempty"`
+}
+
+type ExecutorStreamChunk struct {
+	Payload []byte
+	Error   string `json:"Error,omitempty"`
+}
+
+type ExecutorHTTPRequest struct {
+	AuthID         string
+	AuthProvider   string
+	Method         string
+	URL            string
+	Headers        http.Header
+	Body           []byte
+	StorageJSON    []byte
+	Metadata       map[string]any
+	Attributes     map[string]string
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type ExecutorHTTPResponse struct {
+	StatusCode int
+	Headers    http.Header
+	Body       []byte
+}
+
+type HostHTTPRequest struct {
+	HostCallbackID string      `json:"host_callback_id,omitempty"`
+	Method         string      `json:"method,omitempty"`
+	URL            string      `json:"url,omitempty"`
+	Headers        http.Header `json:"headers,omitempty"`
+	Body           []byte      `json:"body,omitempty"`
+}
+
+type HostHTTPResponse struct {
+	StatusCode int         `json:"status_code"`
+	Headers    http.Header `json:"headers,omitempty"`
+	Body       []byte      `json:"body,omitempty"`
+}
+
+type HostHTTPStreamResponse struct {
+	StatusCode int         `json:"status_code"`
+	Headers    http.Header `json:"headers,omitempty"`
+	StreamID   string      `json:"stream_id,omitempty"`
+}
+
+type HostHTTPStreamReadRequest struct {
+	StreamID string `json:"stream_id"`
+}
+
+type HostHTTPStreamReadResponse struct {
+	Payload []byte `json:"payload,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Done    bool   `json:"done,omitempty"`
+}
+
+type HostHTTPStreamCloseRequest struct {
+	StreamID string `json:"stream_id"`
+}
+
+type HostStreamEmitRequest struct {
+	StreamID string `json:"stream_id"`
+	Payload  []byte `json:"payload,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
+type HostStreamCloseRequest struct {
+	StreamID string `json:"stream_id"`
+	Error    string `json:"error,omitempty"`
+}
+
+type UsageRecord struct {
+	Provider        string        `json:"Provider"`
+	ExecutorType    string        `json:"ExecutorType"`
+	Model           string        `json:"Model"`
+	Alias           string        `json:"Alias"`
+	APIKey          string        `json:"APIKey"`
+	AuthID          string        `json:"AuthID"`
+	AuthIndex       string        `json:"AuthIndex"`
+	AuthType        string        `json:"AuthType"`
+	Source          string        `json:"Source"`
+	ReasoningEffort string        `json:"ReasoningEffort"`
+	ServiceTier     string        `json:"ServiceTier"`
+	RequestedAt     time.Time     `json:"RequestedAt"`
+	Latency         time.Duration `json:"Latency"`
+	TTFT            time.Duration `json:"TTFT"`
+	Failed          bool          `json:"Failed"`
+	Failure         UsageFailure  `json:"Failure"`
+	Detail          UsageDetail   `json:"Detail"`
+	ResponseHeaders http.Header   `json:"ResponseHeaders"`
+}
+
+type UsageFailure struct {
+	StatusCode int    `json:"StatusCode"`
+	Body       string `json:"Body"`
+}
+
+type UsageDetail struct {
+	InputTokens         int64 `json:"InputTokens"`
+	OutputTokens        int64 `json:"OutputTokens"`
+	ReasoningTokens     int64 `json:"ReasoningTokens"`
+	CachedTokens        int64 `json:"CachedTokens"`
+	CacheReadTokens     int64 `json:"CacheReadTokens"`
+	CacheCreationTokens int64 `json:"CacheCreationTokens"`
+	TotalTokens         int64 `json:"TotalTokens"`
+}
+
+type HostRecentRequestEntry struct {
+	Time    string `json:"time"`
+	Success int64  `json:"success"`
+	Failed  int64  `json:"failed"`
+}
+
+// HostIDTokenInfo retains only non-secret plan metadata from CPA auth-list
+// responses. Unknown identity claims and opaque token strings are discarded.
+type HostIDTokenInfo struct {
+	PlanType           string `json:"plan_type,omitempty"`
+	ChatGPTPlanType    string `json:"chatgpt_plan_type,omitempty"`
+	AccountFingerprint string `json:"-"`
+}
+
+func (i *HostIDTokenInfo) UnmarshalJSON(raw []byte) error {
+	if i == nil {
+		return nil
+	}
+	*i = HostIDTokenInfo{}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	if trimmed[0] == '"' {
+		var encoded string
+		if errDecode := json.Unmarshal(trimmed, &encoded); errDecode != nil {
+			return errDecode
+		}
+		encoded = strings.TrimSpace(encoded)
+		if len(encoded) < 2 || len(encoded) > 64<<10 || encoded[0] != '{' {
+			return nil
+		}
+		trimmed = []byte(encoded)
+	}
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil
+	}
+	var decoded struct {
+		PlanType         string `json:"plan_type,omitempty"`
+		ChatGPTPlanType  string `json:"chatgpt_plan_type,omitempty"`
+		AccountID        string `json:"account_id,omitempty"`
+		ChatGPTAccountID string `json:"chatgpt_account_id,omitempty"`
+		OpenAIAuth       struct {
+			AccountID        string `json:"account_id,omitempty"`
+			ChatGPTAccountID string `json:"chatgpt_account_id,omitempty"`
+		} `json:"https://api.openai.com/auth,omitempty"`
+	}
+	if errDecode := json.Unmarshal(trimmed, &decoded); errDecode != nil {
+		return errDecode
+	}
+	i.PlanType = decoded.PlanType
+	i.ChatGPTPlanType = decoded.ChatGPTPlanType
+	accountID := strings.TrimSpace(firstNonEmptyString(
+		decoded.ChatGPTAccountID,
+		decoded.AccountID,
+		decoded.OpenAIAuth.ChatGPTAccountID,
+		decoded.OpenAIAuth.AccountID,
+	))
+	if accountID != "" && len(accountID) <= 4096 {
+		sum := sha256.Sum256([]byte(accountID))
+		i.AccountFingerprint = hex.EncodeToString(sum[:])
+	}
+	return nil
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+type HostAuthFileEntry struct {
+	ID              string                   `json:"id,omitempty"`
+	AuthIndex       string                   `json:"auth_index,omitempty"`
+	Name            string                   `json:"name"`
+	Type            string                   `json:"type,omitempty"`
+	Provider        string                   `json:"provider,omitempty"`
+	Label           string                   `json:"label,omitempty"`
+	Status          string                   `json:"status,omitempty"`
+	StatusMessage   string                   `json:"status_message,omitempty"`
+	Disabled        bool                     `json:"disabled,omitempty"`
+	Unavailable     bool                     `json:"unavailable,omitempty"`
+	RuntimeOnly     bool                     `json:"runtime_only,omitempty"`
+	Source          string                   `json:"source,omitempty"`
+	Path            string                   `json:"path,omitempty"`
+	Size            int64                    `json:"size,omitempty"`
+	ModTime         time.Time                `json:"modtime,omitempty"`
+	UpdatedAt       time.Time                `json:"updated_at,omitempty"`
+	LastRefresh     time.Time                `json:"last_refresh,omitempty"`
+	NextRetryAfter  time.Time                `json:"next_retry_after,omitempty"`
+	Email           string                   `json:"email,omitempty"`
+	ProjectID       string                   `json:"project_id,omitempty"`
+	AccountType     string                   `json:"account_type,omitempty"`
+	PlanType        string                   `json:"plan_type,omitempty"`
+	ChatGPTPlanType string                   `json:"chatgpt_plan_type,omitempty"`
+	IDToken         HostIDTokenInfo          `json:"id_token,omitempty"`
+	Account         string                   `json:"account,omitempty"`
+	Note            string                   `json:"note,omitempty"`
+	Websockets      bool                     `json:"websockets,omitempty"`
+	Success         int64                    `json:"success,omitempty"`
+	Failed          int64                    `json:"failed,omitempty"`
+	RecentRequests  []HostRecentRequestEntry `json:"recent_requests,omitempty"`
+}
+
+type HostAuthListResponse struct {
+	Files []HostAuthFileEntry `json:"files"`
+}
+
+type HostAuthGetRequest struct {
+	AuthIndex string `json:"auth_index"`
+}
+
+type HostAuthGetResponse struct {
+	AuthIndex string          `json:"auth_index"`
+	Name      string          `json:"name,omitempty"`
+	Path      string          `json:"path,omitempty"`
+	JSON      json.RawMessage `json:"json"`
+}
+
+type HostAuthSaveRequest struct {
+	Name string          `json:"name"`
+	JSON json.RawMessage `json:"json"`
+}
+
+type HostAuthSaveResponse struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+type HostAuthRefreshRequest struct {
+	AuthIndex string `json:"auth_index"`
+}
+
+type HostAuthRefreshResponse struct {
+	AuthIndex           string     `json:"auth_index"`
+	Provider            string     `json:"provider,omitempty"`
+	RefreshedAt         time.Time  `json:"refreshed_at"`
+	ExpiresAt           *time.Time `json:"expires_at,omitempty"`
+	RefreshTokenRotated bool       `json:"refresh_token_rotated"`
+}

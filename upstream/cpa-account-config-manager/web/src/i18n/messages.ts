@@ -1,0 +1,117 @@
+import type { Locale } from "./locale";
+
+export const zhCN = {
+  "reason.healthy_recent_success": "最近请求正常",
+  "reason.quota_exhausted": "额度已耗尽",
+  "reason.token_revoked": "令牌已撤销",
+  "reason.invalid_credentials": "凭据无效",
+  "reason.account_deactivated": "账号已停用",
+  "reason.workspace_deactivated": "工作区已停用",
+  "reason.authentication_review": "认证需要复核",
+  "reason.billing_review": "计费状态需要复核",
+  "reason.credential_permission_denied": "凭据权限不足",
+  "reason.native_unavailable": "原生状态不可用",
+  "reason.manual_disabled": "账号由人工禁用",
+  "reason.transient_failure": "上游暂时失败",
+  "reason.unconfirmed_upstream_response": "无法确认上游响应",
+  "reason.passive_circuit_open": "被动临时熔断",
+  "reason.invalid_response": "无法确认上游响应",
+  "reason.upstream_unavailable": "上游服务不可用",
+  "reason.request_timeout": "模型测试超时",
+  "reason.quota_limited": "上游额度或速率受限",
+  "reason.no_recent_evidence": "暂无近期证据",
+  "reason.management_auth_unavailable": "等待已认证的巡检请求后重试",
+  "reason.experimental_probe_unavailable": "上游未执行实验性破限请求",
+  "reason.unknown": "原因待确认",
+} as const;
+
+export type MessageKey = keyof typeof zhCN;
+
+export const en: Record<MessageKey, string> = {
+  "reason.healthy_recent_success": "Recent requests are healthy",
+  "reason.quota_exhausted": "Quota exhausted",
+  "reason.token_revoked": "Token revoked",
+  "reason.invalid_credentials": "Invalid credentials",
+  "reason.account_deactivated": "Account deactivated",
+  "reason.workspace_deactivated": "Workspace deactivated",
+  "reason.authentication_review": "Authentication needs review",
+  "reason.billing_review": "Billing status needs review",
+  "reason.credential_permission_denied": "Credential permission denied",
+  "reason.native_unavailable": "Native status unavailable",
+  "reason.manual_disabled": "Account was disabled manually",
+  "reason.transient_failure": "Temporary upstream failure",
+  "reason.unconfirmed_upstream_response": "Upstream response could not be validated",
+  "reason.passive_circuit_open": "Passive temporary circuit",
+  "reason.invalid_response": "Upstream response could not be validated",
+  "reason.upstream_unavailable": "Upstream service unavailable",
+  "reason.request_timeout": "Model probe timed out",
+  "reason.quota_limited": "Upstream quota or rate limited",
+  "reason.no_recent_evidence": "No recent evidence",
+  "reason.management_auth_unavailable": "Waiting for an authenticated inspection request before retrying",
+  "reason.experimental_probe_unavailable": "The upstream request did not apply the experimental overdraft probe",
+  "reason.unknown": "Reason requires review",
+};
+
+export const zhTW: Record<MessageKey, string> = {
+  "reason.healthy_recent_success": "最近請求正常",
+  "reason.quota_exhausted": "額度已用盡",
+  "reason.token_revoked": "權杖已撤銷",
+  "reason.invalid_credentials": "憑證無效",
+  "reason.account_deactivated": "帳號已停用",
+  "reason.workspace_deactivated": "工作區已停用",
+  "reason.authentication_review": "驗證需要複核",
+  "reason.billing_review": "計費狀態需要複核",
+  "reason.credential_permission_denied": "憑證權限不足",
+  "reason.native_unavailable": "原生狀態不可用",
+  "reason.manual_disabled": "帳號由使用者手動停用",
+  "reason.transient_failure": "上游暫時失敗",
+  "reason.unconfirmed_upstream_response": "無法確認上游回應",
+  "reason.passive_circuit_open": "被動暫時熔斷",
+  "reason.invalid_response": "無法確認上游回應",
+  "reason.upstream_unavailable": "上游服務無法使用",
+  "reason.request_timeout": "模型測試逾時",
+  "reason.quota_limited": "上游額度或速率受限",
+  "reason.no_recent_evidence": "暫無近期證據",
+  "reason.management_auth_unavailable": "等待已驗證的巡檢請求後重試",
+  "reason.experimental_probe_unavailable": "上游未執行實驗性破限請求",
+  "reason.unknown": "原因待確認",
+};
+
+export const ru: Record<MessageKey, string> = {
+  "reason.healthy_recent_success": "Последние запросы успешны",
+  "reason.quota_exhausted": "Квота исчерпана",
+  "reason.token_revoked": "Токен отозван",
+  "reason.invalid_credentials": "Недействительные учётные данные",
+  "reason.account_deactivated": "Учётная запись деактивирована",
+  "reason.workspace_deactivated": "Рабочая область деактивирована",
+  "reason.authentication_review": "Требуется проверка авторизации",
+  "reason.billing_review": "Требуется проверка оплаты",
+  "reason.credential_permission_denied": "Недостаточно прав учётных данных",
+  "reason.native_unavailable": "Исходный статус недоступен",
+  "reason.manual_disabled": "Учётная запись отключена вручную",
+  "reason.transient_failure": "Временный сбой вышестоящего сервиса",
+  "reason.unconfirmed_upstream_response": "Не удалось проверить ответ вышестоящего сервиса",
+  "reason.passive_circuit_open": "Временный пассивный предохранитель",
+  "reason.invalid_response": "Не удалось проверить ответ вышестоящего сервиса",
+  "reason.upstream_unavailable": "Вышестоящий сервис недоступен",
+  "reason.request_timeout": "Истекло время проверки модели",
+  "reason.quota_limited": "Ограничение квоты или частоты вышестоящего сервиса",
+  "reason.no_recent_evidence": "Нет недавних данных",
+  "reason.management_auth_unavailable": "Повтор после авторизованного запроса проверки",
+  "reason.experimental_probe_unavailable": "Вышестоящий запрос не применил экспериментальную проверку перерасхода",
+  "reason.unknown": "Причина требует проверки",
+};
+
+const catalogs: Record<Locale, Record<MessageKey, string>> = {
+  "zh-CN": zhCN,
+  "zh-TW": zhTW,
+  en,
+  ru,
+};
+
+export type TranslationValues = Record<string, string | number>;
+
+export function translate(locale: Locale, key: MessageKey, values: TranslationValues = {}): string {
+  const template = catalogs[locale]?.[key] ?? en[key] ?? String(key);
+  return template.replace(/\{([a-z_]+)\}/gi, (_, name: string) => String(values[name] ?? `{${name}}`));
+}

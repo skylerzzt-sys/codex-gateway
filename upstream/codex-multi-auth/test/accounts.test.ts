@@ -1,0 +1,4921 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import {
+	AccountManager,
+	extractAccountEmail,
+	formatAccountLabel,
+	formatWorkspaceLines,
+	parseRateLimitReason,
+	sanitizeEmail,
+	formatWaitTime,
+	formatCooldown,
+	shouldUpdateAccountIdFromToken,
+	getAccountIdCandidates,
+	getRuntimeTrackerKey,
+} from "../lib/accounts.js";
+import {
+	getHealthTracker,
+	getTokenTracker,
+	resetTrackers,
+	DEFAULT_TOKEN_BUCKET_CONFIG,
+} from "../lib/rotation.js";
+import { CodexAuthError } from "../lib/errors.js";
+import {
+	clearCircuitBreakers,
+	DEFAULT_CIRCUIT_BREAKER_CONFIG,
+	getCircuitBreaker,
+} from "../lib/circuit-breaker.js";
+import {
+	getAccountIdentityKey,
+	getRuntimeAccountIdentityKey,
+} from "../lib/storage/identity.js";
+import {
+	getStoragePathState,
+	setStoragePathState,
+} from "../lib/storage/path-state.js";
+import type { AccountStorageV3 } from "../lib/storage.js";
+import type { OAuthAuthDetails } from "../lib/types.js";
+import { MODEL_FAMILIES } from "../lib/prompts/codex.js";
+
+vi.mock("../lib/storage.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../lib/storage.js")>();
+	return {
+		...actual,
+		saveAccounts: vi.fn().mockResolvedValue(undefined),
+		withAccountStorageTransaction: vi.fn(),
+	};
+});
+
+beforeEach(async () => {
+	resetTrackers();
+	setStoragePathState({
+		currentStoragePath: null,
+		currentLegacyProjectStoragePath: null,
+		currentLegacyWorktreeStoragePath: null,
+		currentProjectRoot: null,
+	});
+	const { saveAccounts, withAccountStorageTransaction } = await import(
+		"../lib/storage.js"
+	);
+	const mockSaveAccounts = vi.mocked(saveAccounts);
+	const mockWithAccountStorageTransaction = vi.mocked(
+		withAccountStorageTransaction,
+	);
+
+	mockSaveAccounts.mockReset();
+	mockSaveAccounts.mockResolvedValue(undefined);
+	mockWithAccountStorageTransaction.mockReset();
+	mockWithAccountStorageTransaction.mockImplementation(async (handler) => {
+		let current = null;
+		const persist = async (storage: Parameters<typeof saveAccounts>[0]) => {
+			current = structuredClone(storage);
+			await mockSaveAccounts(storage);
+		};
+		return handler(current as never, persist);
+	});
+});
+
+afterEach(() => {
+	setStoragePathState({
+		currentStoragePath: null,
+		currentLegacyProjectStoragePath: null,
+		currentLegacyWorktreeStoragePath: null,
+		currentProjectRoot: null,
+	});
+});
+
+describe("parseRateLimitReason", () => {
+	it("returns quota for quota-related codes", () => {
+		expect(parseRateLimitReason("usage_limit_reached")).toBe("quota");
+		expect(parseRateLimitReason("QUOTA_EXCEEDED")).toBe("quota");
+		expect(parseRateLimitReason("monthly_quota_limit")).toBe("quota");
+	});
+
+	it("returns tokens for token-related codes", () => {
+		expect(parseRateLimitReason("tpm_limit")).toBe("tokens");
+		expect(parseRateLimitReason("rpm_exceeded")).toBe("tokens");
+		expect(parseRateLimitReason("token_limit_reached")).toBe("tokens");
+		expect(parseRateLimitReason("TPM_RATE_LIMIT")).toBe("tokens");
+	});
+
+	it("returns concurrent for concurrency codes", () => {
+		expect(parseRateLimitReason("concurrent_limit")).toBe("concurrent");
+		expect(parseRateLimitReason("parallel_requests_exceeded")).toBe(
+			"concurrent",
+		);
+	});
+
+	it("returns unknown for undefined", () => {
+		expect(parseRateLimitReason(undefined)).toBe("unknown");
+	});
+
+	it("returns unknown for unrecognized codes", () => {
+		expect(parseRateLimitReason("some_other_error")).toBe("unknown");
+		expect(parseRateLimitReason("random_code")).toBe("unknown");
+	});
+});
+
+describe("sanitizeEmail", () => {
+	it("returns undefined for undefined/null", () => {
+		expect(sanitizeEmail(undefined)).toBeUndefined();
+	});
+
+	it("returns undefined for empty string", () => {
+		expect(sanitizeEmail("")).toBeUndefined();
+		expect(sanitizeEmail("   ")).toBeUndefined();
+	});
+
+	it("returns undefined for string without @", () => {
+		expect(sanitizeEmail("notanemail")).toBeUndefined();
+	});
+
+	it("trims and lowercases valid email", () => {
+		expect(sanitizeEmail("  User@Example.COM  ")).toBe("user@example.com");
+	});
+
+	it("preserves valid email structure", () => {
+		expect(sanitizeEmail("test@domain.org")).toBe("test@domain.org");
+	});
+});
+
+describe("formatWaitTime", () => {
+	it("formats zero as 0s", () => {
+		expect(formatWaitTime(0)).toBe("0s");
+	});
+
+	it("formats negative as 0s", () => {
+		expect(formatWaitTime(-1000)).toBe("0s");
+	});
+
+	it("formats seconds only when less than 60s", () => {
+		expect(formatWaitTime(45000)).toBe("45s");
+		expect(formatWaitTime(1000)).toBe("1s");
+	});
+
+	it("formats minutes and seconds when 60s or more", () => {
+		expect(formatWaitTime(60000)).toBe("1m 0s");
+		expect(formatWaitTime(150000)).toBe("2m 30s");
+		expect(formatWaitTime(3600000)).toBe("60m 0s");
+	});
+
+	it("rounds down partial seconds", () => {
+		expect(formatWaitTime(45500)).toBe("45s");
+		expect(formatWaitTime(150999)).toBe("2m 30s");
+	});
+});
+
+describe("formatCooldown", () => {
+	it("returns null when coolingDownUntil is undefined", () => {
+		expect(formatCooldown({})).toBeNull();
+	});
+
+	it("returns null when cooldown has expired", () => {
+		const now = Date.now();
+		expect(formatCooldown({ coolingDownUntil: now - 1000 }, now)).toBeNull();
+		expect(formatCooldown({ coolingDownUntil: now }, now)).toBeNull();
+	});
+
+	it("returns formatted time when cooling down", () => {
+		const now = Date.now();
+		const result = formatCooldown({ coolingDownUntil: now + 30000 }, now);
+		expect(result).toBe("30s");
+	});
+
+	it("includes reason when present", () => {
+		const now = Date.now();
+		const result = formatCooldown(
+			{ coolingDownUntil: now + 60000, cooldownReason: "auth-failure" },
+			now,
+		);
+		expect(result).toBe("1m 0s (auth-failure)");
+	});
+
+	it("formats minutes and seconds with reason", () => {
+		const now = Date.now();
+		const result = formatCooldown(
+			{ coolingDownUntil: now + 150000, cooldownReason: "network-error" },
+			now,
+		);
+		expect(result).toBe("2m 30s (network-error)");
+	});
+});
+
+describe("shouldUpdateAccountIdFromToken", () => {
+	it("returns true when currentAccountId is undefined", () => {
+		expect(shouldUpdateAccountIdFromToken("token", undefined)).toBe(true);
+	});
+
+	it("returns true when source is undefined", () => {
+		expect(shouldUpdateAccountIdFromToken(undefined, "account-123")).toBe(true);
+	});
+
+	it("returns true when source is token", () => {
+		expect(shouldUpdateAccountIdFromToken("token", "account-123")).toBe(true);
+	});
+
+	it("returns true when source is id_token", () => {
+		expect(shouldUpdateAccountIdFromToken("id_token", "account-123")).toBe(
+			true,
+		);
+	});
+
+	it("returns false when source is org (manual selection)", () => {
+		expect(shouldUpdateAccountIdFromToken("org", "account-123")).toBe(false);
+	});
+
+	it("returns false when source is manual", () => {
+		expect(shouldUpdateAccountIdFromToken("manual", "account-123")).toBe(false);
+	});
+});
+
+describe("getAccountIdCandidates", () => {
+	it("returns empty array when no tokens provided", () => {
+		expect(getAccountIdCandidates()).toEqual([]);
+	});
+
+	it("extracts account from access token", () => {
+		// Create a JWT with account_id in the claim path
+		const payload = {
+			"https://api.openai.com/auth": {
+				chatgpt_account_id: "test-account-123",
+			},
+		};
+		const token = `header.${Buffer.from(JSON.stringify(payload)).toString("base64")}.signature`;
+		const candidates = getAccountIdCandidates(token);
+		expect(candidates.length).toBeGreaterThanOrEqual(1);
+		expect(candidates[0]?.accountId).toBe("test-account-123");
+		expect(candidates[0]?.source).toBe("token");
+		expect(candidates[0]?.isDefault).toBe(true);
+	});
+
+	it("extracts email from id_token when present", () => {
+		const idPayload = { email: "user@example.com" };
+		const idToken = `header.${Buffer.from(JSON.stringify(idPayload)).toString("base64")}.signature`;
+		const email = extractAccountEmail(undefined, idToken);
+		expect(email).toBe("user@example.com");
+	});
+});
+
+describe("AccountManager", () => {
+	it("seeds from fallback auth when no storage exists", () => {
+		const auth: OAuthAuthDetails = {
+			type: "oauth",
+			access: "access-token",
+			refresh: "refresh-token",
+			expires: Date.now() + 60_000,
+		};
+
+		const manager = new AccountManager(auth, null);
+		expect(manager.getAccountCount()).toBe(1);
+		expect(manager.getCurrentAccount()?.refreshToken).toBe("refresh-token");
+	});
+
+	it("returns account by index and rejects invalid indexes", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			accounts: [
+				{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+				{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+			],
+		};
+
+		const manager = new AccountManager(undefined, stored);
+		expect(manager.getAccountByIndex(0)?.refreshToken).toBe("token-1");
+		expect(manager.getAccountByIndex(1)?.refreshToken).toBe("token-2");
+		expect(manager.getAccountByIndex(-1)).toBeNull();
+		expect(manager.getAccountByIndex(9)).toBeNull();
+		expect(manager.getAccountByIndex(Number.NaN)).toBeNull();
+	});
+
+	it("does not disable a different current workspace after another request already rotated away", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			accounts: [
+				{
+					refreshToken: "token-1",
+					addedAt: now,
+					lastUsed: now,
+					workspaces: [
+						{ id: "workspace-1", name: "Workspace 1", enabled: true },
+						{ id: "workspace-2", name: "Workspace 2", enabled: true },
+					],
+					currentWorkspaceIndex: 0,
+				},
+			],
+		};
+
+		const manager = new AccountManager(undefined, stored);
+		const account = manager.getAccountByIndex(0);
+		expect(account).not.toBeNull();
+		if (!account) {
+			throw new Error("account should exist");
+		}
+
+		expect(manager.disableCurrentWorkspace(account, "workspace-1")).toBe(true);
+		expect(manager.rotateToNextWorkspace(account)?.id).toBe("workspace-2");
+
+		expect(manager.disableCurrentWorkspace(account, "workspace-1")).toBe(false);
+		expect(account.enabled).not.toBe(false);
+		expect(manager.hasEnabledWorkspaces(account)).toBe(true);
+		expect(manager.getEnabledWorkspaceCount(account)).toBe(1);
+		expect(manager.getCurrentWorkspace(account)?.id).toBe("workspace-2");
+		expect(account.workspaces?.map((workspace) => workspace.enabled)).toEqual([
+			false,
+			true,
+		]);
+	});
+
+	it("re-enabling an exhausted account restores its workspaces", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			accounts: [
+				{
+					refreshToken: "token-1",
+					addedAt: now,
+					lastUsed: now,
+					enabled: false,
+					workspaces: [
+						{
+							id: "workspace-1",
+							name: "Workspace 1",
+							enabled: false,
+							disabledAt: now - 2_000,
+							isDefault: true,
+						},
+						{
+							id: "workspace-2",
+							name: "Workspace 2",
+							enabled: false,
+							disabledAt: now - 1_000,
+						},
+					],
+					currentWorkspaceIndex: 1,
+				},
+			],
+		};
+
+		const manager = new AccountManager(undefined, stored);
+		const account = manager.setAccountEnabled(0, true);
+		expect(account).not.toBeNull();
+		if (!account) {
+			throw new Error("account should exist");
+		}
+
+		expect(account.enabled).toBe(true);
+		expect(manager.hasEnabledWorkspaces(account)).toBe(true);
+		expect(manager.getEnabledWorkspaceCount(account)).toBe(2);
+		expect(account.currentWorkspaceIndex).toBe(0);
+		expect(manager.getCurrentWorkspace(account)?.id).toBe("workspace-1");
+		expect(account.workspaces).toEqual([
+			{
+				id: "workspace-1",
+				name: "Workspace 1",
+				enabled: true,
+				isDefault: true,
+			},
+			{ id: "workspace-2", name: "Workspace 2", enabled: true },
+		]);
+	});
+
+	it("re-enabling an exhausted account without a default workspace resets to the first workspace", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			accounts: [
+				{
+					refreshToken: "token-1",
+					addedAt: now,
+					lastUsed: now,
+					enabled: false,
+					workspaces: [
+						{
+							id: "workspace-1",
+							name: "Workspace 1",
+							enabled: false,
+							disabledAt: now - 2_000,
+						},
+						{
+							id: "workspace-2",
+							name: "Workspace 2",
+							enabled: false,
+							disabledAt: now - 1_000,
+						},
+					],
+					currentWorkspaceIndex: 1,
+				},
+			],
+		};
+
+		const manager = new AccountManager(undefined, stored);
+		const account = manager.setAccountEnabled(0, true);
+		expect(account).not.toBeNull();
+		if (!account) {
+			throw new Error("account should exist");
+		}
+
+		expect(account.currentWorkspaceIndex).toBe(0);
+		expect(manager.getCurrentWorkspace(account)?.id).toBe("workspace-1");
+		expect(account.workspaces).toEqual([
+			{ id: "workspace-1", name: "Workspace 1", enabled: true },
+			{ id: "workspace-2", name: "Workspace 2", enabled: true },
+		]);
+	});
+
+	it("checks account availability by enabled/rate-limit/cooldown state", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			accounts: [
+				{
+					refreshToken: "token-1",
+					addedAt: now,
+					lastUsed: now,
+					enabled: false,
+				},
+				{
+					refreshToken: "token-2",
+					addedAt: now,
+					lastUsed: now,
+					rateLimitResetTimes: { codex: now + 60_000 },
+				},
+				{
+					refreshToken: "token-3",
+					addedAt: now,
+					lastUsed: now,
+					coolingDownUntil: now + 60_000,
+					cooldownReason: "network-error" as const,
+				},
+				{
+					refreshToken: "token-4",
+					addedAt: now,
+					lastUsed: now,
+				},
+			],
+		};
+
+		const manager = new AccountManager(undefined, stored);
+
+		expect(manager.isAccountAvailableForFamily(0, "codex")).toBe(false);
+		expect(manager.isAccountAvailableForFamily(1, "codex")).toBe(false);
+		expect(manager.isAccountAvailableForFamily(2, "codex")).toBe(false);
+		expect(manager.isAccountAvailableForFamily(3, "codex")).toBe(true);
+	});
+
+	it("treats accounts with all tracked workspaces disabled as unavailable for selection", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [
+				{
+					refreshToken: "token-workspace-disabled",
+					addedAt: now,
+					lastUsed: now,
+					workspaces: [
+						{ id: "workspace-1", name: "Workspace 1", enabled: false },
+						{ id: "workspace-2", name: "Workspace 2", enabled: false },
+					],
+					currentWorkspaceIndex: 0,
+				},
+				{
+					refreshToken: "token-ready",
+					addedAt: now,
+					lastUsed: now - 10_000,
+				},
+			],
+		};
+
+		const manager = new AccountManager(undefined, stored as never);
+
+		expect(manager.isAccountAvailableForFamily(0, "codex")).toBe(false);
+		expect(manager.getCurrentOrNextForFamily("codex")?.refreshToken).toBe(
+			"token-ready",
+		);
+		expect(manager.getNextForFamily("codex")?.refreshToken).toBe("token-ready");
+		expect(manager.getCurrentOrNextForFamilyHybrid("codex")?.refreshToken).toBe(
+			"token-ready",
+		);
+	});
+
+	it("keeps workspace-less legacy accounts eligible for selection", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [{ refreshToken: "token-legacy", addedAt: now, lastUsed: now }],
+		};
+
+		const manager = new AccountManager(undefined, stored as never);
+
+		expect(manager.hasEnabledWorkspaces(manager.getAccountByIndex(0)!)).toBe(
+			true,
+		);
+		expect(manager.isAccountAvailableForFamily(0, "codex")).toBe(true);
+		expect(manager.getCurrentOrNextForFamily("codex")?.refreshToken).toBe(
+			"token-legacy",
+		);
+	});
+
+	it("returns false for invalid account index in availability checks", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+		};
+		const manager = new AccountManager(undefined, stored);
+		expect(manager.isAccountAvailableForFamily(-1, "codex")).toBe(false);
+		expect(manager.isAccountAvailableForFamily(99, "codex")).toBe(false);
+		expect(manager.isAccountAvailableForFamily(Number.NaN, "codex")).toBe(
+			false,
+		);
+	});
+
+	it("clears expired rate-limit windows before availability check", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			accounts: [
+				{
+					refreshToken: "token-1",
+					addedAt: now,
+					lastUsed: now,
+					rateLimitResetTimes: { codex: now - 1_000 },
+				},
+			],
+		};
+		const manager = new AccountManager(undefined, stored);
+		expect(manager.isAccountAvailableForFamily(0, "codex")).toBe(true);
+		const account = manager.getAccountByIndex(0);
+		expect(account?.rateLimitResetTimes?.codex).toBeUndefined();
+	});
+
+	it("does not block available accounts just because another token expires later", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			accounts: [
+				{
+					refreshToken: "token-stale",
+					accessToken: "access-stale",
+					expiresAt: now + 60_000,
+					addedAt: now,
+					lastUsed: now,
+				},
+				{
+					refreshToken: "token-fresh",
+					accessToken: "access-fresh",
+					expiresAt: now + 10 * 60_000,
+					addedAt: now,
+					lastUsed: now,
+				},
+			],
+		};
+		const manager = new AccountManager(undefined, stored);
+
+		expect(manager.isAccountAvailableForFamily(0, "codex")).toBe(true);
+		expect(manager.isAccountAvailableForFamily(1, "codex")).toBe(true);
+	});
+
+	it("keeps stale accounts available when the whole pool is stale", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			accounts: [
+				{
+					refreshToken: "token-stale-1",
+					accessToken: "access-stale-1",
+					expiresAt: now + 60_000,
+					addedAt: now,
+					lastUsed: now,
+				},
+				{
+					refreshToken: "token-stale-2",
+					accessToken: "access-stale-2",
+					expiresAt: now + 120_000,
+					addedAt: now,
+					lastUsed: now,
+				},
+			],
+		};
+		const manager = new AccountManager(undefined, stored);
+
+		expect(manager.isAccountAvailableForFamily(0, "codex")).toBe(true);
+		expect(manager.isAccountAvailableForFamily(1, "codex")).toBe(true);
+	});
+
+	it("rotates when the active account is rate-limited", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			accounts: [
+				{
+					refreshToken: "token-1",
+					addedAt: now,
+					lastUsed: now,
+					rateLimitResetTimes: { codex: now + 60_000 },
+				},
+				{
+					refreshToken: "token-2",
+					addedAt: now,
+					lastUsed: now,
+				},
+			],
+		};
+
+		const manager = new AccountManager(undefined, stored);
+		const account = manager.getCurrentOrNext();
+		expect(account?.refreshToken).toBe("token-2");
+		expect(manager.getMinWaitTime()).toBe(0);
+	});
+
+	it("skips accounts that are cooling down", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			accounts: [
+				{
+					refreshToken: "token-1",
+					addedAt: now,
+					lastUsed: now,
+					coolingDownUntil: now + 60_000,
+					cooldownReason: "auth-failure" as const,
+				},
+				{
+					refreshToken: "token-2",
+					addedAt: now,
+					lastUsed: now,
+				},
+			],
+		};
+
+		const manager = new AccountManager(undefined, stored);
+		const account = manager.getCurrentOrNext();
+		expect(account?.refreshToken).toBe("token-2");
+		expect(manager.getActiveIndex()).toBe(1);
+	});
+
+	it("returns min wait time when all accounts are blocked", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			accounts: [
+				{
+					refreshToken: "token-1",
+					addedAt: now,
+					lastUsed: now,
+					coolingDownUntil: now + 60_000,
+					cooldownReason: "network-error" as const,
+				},
+				{
+					refreshToken: "token-2",
+					addedAt: now,
+					lastUsed: now,
+					rateLimitResetTimes: { codex: now + 120_000 },
+				},
+			],
+		};
+
+		const manager = new AccountManager(undefined, stored);
+		const waitMs = manager.getMinWaitTime();
+		expect(waitMs).toBeGreaterThan(0);
+		expect(waitMs).toBeLessThanOrEqual(60_000);
+	});
+
+	it("debounces account toasts for the same account index", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			accounts: [
+				{
+					refreshToken: "token-1",
+					addedAt: now,
+					lastUsed: now,
+				},
+				{
+					refreshToken: "token-2",
+					addedAt: now,
+					lastUsed: now,
+				},
+			],
+		};
+
+		const manager = new AccountManager(undefined, stored);
+		expect(manager.shouldShowAccountToast(0, 60_000)).toBe(true);
+		manager.markToastShown(0);
+		expect(manager.shouldShowAccountToast(0, 60_000)).toBe(false);
+		expect(manager.shouldShowAccountToast(1, 60_000)).toBe(true);
+	});
+
+	it("extracts email from jwt when present", () => {
+		const payload = Buffer.from(
+			JSON.stringify({ email: "user@example.com" }),
+		).toString("base64");
+		const token = `header.${payload}.signature`;
+		expect(extractAccountEmail(token)).toBe("user@example.com");
+	});
+
+	it("formats account label preferring email and id suffix", () => {
+		expect(
+			formatAccountLabel(
+				{ email: "user@example.com", accountId: "abcdef123456" },
+				0,
+			),
+		).toBe("Account 1 (user@example.com, id:123456)");
+		expect(formatAccountLabel({ email: "user@example.com" }, 1)).toBe(
+			"Account 2 (user@example.com)",
+		);
+		expect(formatAccountLabel({ accountId: "abcdef123456" }, 2)).toBe(
+			"Account 3 (123456)",
+		);
+		expect(formatAccountLabel(undefined as any, 3)).toBe("Account 4");
+	});
+
+	it("formats account label with accountLabel variations", () => {
+		expect(formatAccountLabel({ accountLabel: "Work" }, 0)).toBe(
+			"Account 1 (Work)",
+		);
+		expect(
+			formatAccountLabel({ accountLabel: "Work", email: "work@co.com" }, 0),
+		).toBe("Account 1 (Work, work@co.com)");
+		expect(
+			formatAccountLabel(
+				{ accountLabel: "Work", accountId: "abcdef123456" },
+				0,
+			),
+		).toBe("Account 1 (Work, id:123456)");
+		expect(
+			formatAccountLabel(
+				{
+					accountLabel: "Work",
+					email: "work@co.com",
+					accountId: "abcdef123456",
+				},
+				0,
+			),
+		).toBe("Account 1 (Work, work@co.com, id:123456)");
+	});
+
+	it("formats account label with short accountId", () => {
+		expect(formatAccountLabel({ accountId: "abc" }, 0)).toBe("Account 1 (abc)");
+		expect(formatAccountLabel({ accountId: "123456" }, 0)).toBe(
+			"Account 1 (123456)",
+		);
+	});
+
+	it("surfaces the active workspace to distinguish same-email accounts (#491)", () => {
+		const personal = {
+			email: "user@gmail.com",
+			accountId: "org-AAAA",
+			workspaces: [{ id: "org-AAAA", name: "Personal Plus", enabled: true }],
+			currentWorkspaceIndex: 0,
+		};
+		const business = {
+			email: "user@gmail.com",
+			accountId: "org-BBBB",
+			workspaces: [{ id: "org-BBBB", name: "GkTech Business", enabled: true }],
+			currentWorkspaceIndex: 0,
+		};
+		expect(formatAccountLabel(personal, 0)).toBe(
+			"Account 1 ([Personal Plus], user@gmail.com, id:g-AAAA)",
+		);
+		expect(formatAccountLabel(business, 1)).toBe(
+			"Account 2 ([GkTech Business], user@gmail.com, id:g-BBBB)",
+		);
+	});
+
+	it("follows currentWorkspaceIndex when picking the workspace tag (#491)", () => {
+		expect(
+			formatAccountLabel(
+				{
+					email: "user@gmail.com",
+					workspaces: [
+						{ id: "org-AAAA", name: "Personal Plus", enabled: true },
+						{ id: "org-BBBB", name: "GkTech Business", enabled: true },
+					],
+					currentWorkspaceIndex: 1,
+				},
+				0,
+			),
+		).toBe("Account 1 ([GkTech Business], user@gmail.com)");
+	});
+
+	it("omits the workspace tag when it duplicates the account label (#491)", () => {
+		expect(
+			formatAccountLabel(
+				{
+					accountLabel: "Personal Plus",
+					email: "user@gmail.com",
+					workspaces: [
+						{ id: "org-AAAA", name: "Personal Plus", enabled: true },
+					],
+					currentWorkspaceIndex: 0,
+				},
+				0,
+			),
+		).toBe("Account 1 (Personal Plus, user@gmail.com)");
+	});
+
+	it("ignores empty or unnamed workspaces in the label (#491)", () => {
+		expect(
+			formatAccountLabel(
+				{
+					email: "user@gmail.com",
+					workspaces: [{ id: "org-AAAA", enabled: true }],
+					currentWorkspaceIndex: 0,
+				},
+				0,
+			),
+		).toBe("Account 1 (user@gmail.com)");
+		expect(
+			formatAccountLabel(
+				{ email: "user@gmail.com", workspaces: [], currentWorkspaceIndex: 0 },
+				0,
+			),
+		).toBe("Account 1 (user@gmail.com)");
+	});
+
+	it("lists workspaces with the active one marked (#491)", () => {
+		const lines = formatWorkspaceLines({
+			workspaces: [
+				{ id: "org-AAAA", name: "Personal Plus", enabled: true },
+				{ id: "org-BBBB", name: "GkTech Business", enabled: true },
+			],
+			currentWorkspaceIndex: 1,
+		});
+		expect(lines).toEqual([
+			"   - 1. [Personal Plus] id:g-AAAA",
+			"   * 2. [GkTech Business] id:g-BBBB (active)",
+		]);
+	});
+
+	it("marks disabled workspaces and honors a custom indent (#491)", () => {
+		const lines = formatWorkspaceLines(
+			{
+				workspaces: [
+					{ id: "org-AAAA", name: "Personal Plus", enabled: true },
+					{ id: "org-BBBB", enabled: false, disabledAt: 1 },
+				],
+				currentWorkspaceIndex: 0,
+			},
+			"  ",
+		);
+		expect(lines).toEqual([
+			"  * 1. [Personal Plus] id:g-AAAA (active)",
+			"  - 2. [(unnamed)] id:g-BBBB (disabled)",
+		]);
+	});
+
+	it("returns no workspace lines when none are tracked (#491)", () => {
+		expect(formatWorkspaceLines(undefined)).toEqual([]);
+		expect(formatWorkspaceLines({})).toEqual([]);
+		expect(formatWorkspaceLines({ workspaces: [] })).toEqual([]);
+	});
+
+	it("performs true round-robin rotation across multiple requests", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			accounts: [
+				{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+				{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+				{ refreshToken: "token-3", addedAt: now, lastUsed: now },
+			],
+		};
+
+		const manager = new AccountManager(undefined, stored);
+
+		const first = manager.getCurrentOrNext();
+		const second = manager.getCurrentOrNext();
+		const third = manager.getCurrentOrNext();
+		const fourth = manager.getCurrentOrNext();
+
+		expect(first?.refreshToken).toBe("token-1");
+		expect(second?.refreshToken).toBe("token-2");
+		expect(third?.refreshToken).toBe("token-3");
+		expect(fourth?.refreshToken).toBe("token-1");
+	});
+
+	it("skips rate-limited accounts during rotation", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			accounts: [
+				{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+				{
+					refreshToken: "token-2",
+					addedAt: now,
+					lastUsed: now,
+					rateLimitResetTimes: { codex: now + 60_000 },
+				},
+				{ refreshToken: "token-3", addedAt: now, lastUsed: now },
+			],
+		};
+
+		const manager = new AccountManager(undefined, stored);
+
+		const first = manager.getCurrentOrNext();
+		const second = manager.getCurrentOrNext();
+		const third = manager.getCurrentOrNext();
+
+		expect(first?.refreshToken).toBe("token-1");
+		expect(second?.refreshToken).toBe("token-3");
+		expect(third?.refreshToken).toBe("token-1");
+	});
+
+	it("uses independent cursors per model family", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			accounts: [
+				{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+				{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+			],
+		};
+
+		const manager = new AccountManager(undefined, stored);
+
+		const codexFirst = manager.getCurrentOrNextForFamily("codex");
+		const gpt51First = manager.getCurrentOrNextForFamily("gpt-5.1");
+		const codexSecond = manager.getCurrentOrNextForFamily("codex");
+		const gpt51Second = manager.getCurrentOrNextForFamily("gpt-5.1");
+
+		expect(codexFirst?.refreshToken).toBe("token-1");
+		expect(gpt51First?.refreshToken).toBe("token-1");
+		expect(codexSecond?.refreshToken).toBe("token-2");
+		expect(gpt51Second?.refreshToken).toBe("token-2");
+	});
+
+	it("keeps cursor ordering even when another access token lives longer", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [
+				{
+					refreshToken: "token-stale",
+					accessToken: "access-stale",
+					expiresAt: now + 60_000,
+					addedAt: now,
+					lastUsed: now,
+				},
+				{
+					refreshToken: "token-fresh",
+					accessToken: "access-fresh",
+					expiresAt: now + 10 * 60_000,
+					addedAt: now,
+					lastUsed: now - 5_000,
+				},
+			],
+		};
+
+		const manager = new AccountManager(undefined, stored as never);
+		const selected = manager.getCurrentOrNextForFamily("codex");
+
+		expect(selected?.refreshToken).toBe("token-stale");
+	});
+
+	it("hybrid selection prefers the healthier candidate over the active index", () => {
+		const now = Date.now();
+		const stored = {
+			version: 3 as const,
+			activeIndex: 1, // Set active index to second account
+			activeIndexByFamily: { codex: 1 },
+			accounts: [
+				{ refreshToken: "token-1", addedAt: now, lastUsed: 0 }, // Very stale (high freshness score)
+				{ refreshToken: "token-2", addedAt: now, lastUsed: now }, // Just used (low freshness score)
+			],
+		};
+
+		const manager = new AccountManager(undefined, stored as any);
+
+		const selected = manager.getCurrentOrNextForFamilyHybrid("codex");
+		expect(selected?.refreshToken).toBe("token-1");
+		expect(selected?.index).toBe(0);
+	});
+
+	describe("removeAccount", () => {
+		it("removes an account and updates indices", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 1,
+				accounts: [
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-3", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			expect(manager.getAccountCount()).toBe(3);
+
+			const accountToRemove = manager.getCurrentAccount();
+			expect(accountToRemove).toBeDefined();
+			expect(accountToRemove?.refreshToken).toBe("token-2");
+
+			const removed = manager.removeAccount(accountToRemove!);
+			expect(removed).toBe(true);
+			expect(manager.getAccountCount()).toBe(2);
+
+			const remaining = manager.getAccountsSnapshot();
+			expect(remaining[0]?.refreshToken).toBe("token-1");
+			expect(remaining[1]?.refreshToken).toBe("token-3");
+			expect(remaining[0]?.index).toBe(0);
+			expect(remaining[1]?.index).toBe(1);
+		});
+
+		// Regression (accounts-02): removing an account must clear its identity-keyed
+		// health/token state so a later re-add of the same identity starts fresh
+		// instead of inheriting the old penalty.
+		it("clears identity-keyed health state when an account is removed", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{ refreshToken: "tok-a", accountId: "acc_stable", addedAt: now, lastUsed: now },
+					{ refreshToken: "tok-b", accountId: "acc_other", addedAt: now, lastUsed: now },
+				],
+			};
+			const manager = new AccountManager(undefined, stored);
+
+			const target = manager
+				.getAccountsSnapshot()
+				.find((a) => a.accountId === "acc_stable");
+			expect(target).toBeDefined();
+			// Resolve the real identity key the trackers use (e.g. "account:acc_stable").
+			const identityKey = getRuntimeTrackerKey(target!);
+			expect(identityKey).toBe("account:acc_stable");
+
+			// accounts-02 (extended): consume a token and open the breaker BEFORE the
+			// health failures (an open breaker would otherwise block consumeToken), so
+			// the regression fails if removeAccount stops clearing token buckets
+			// (lib/rotation.ts clearAccountKey) or stale circuit breakers
+			// (lib/circuit-breaker.ts). Use a LIVE reference for these mutations.
+			const liveStable = manager.getAccountByIndex(0);
+			expect(liveStable?.accountId).toBe("acc_stable");
+			expect(manager.consumeToken(liveStable!, "codex")).toBe(true);
+			const tokenTracker = getTokenTracker();
+			expect(tokenTracker.getTokens(identityKey, "codex")).toBeLessThan(
+				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
+			);
+			const breakerKey = getAccountIdentityKey(liveStable!)!;
+			const breaker = getCircuitBreaker(breakerKey);
+			breaker.recordFailure();
+			breaker.recordFailure();
+			breaker.recordFailure();
+			expect(breaker.getState()).toBe("open");
+
+			// Drive the stable account's health score down via repeated failures.
+			// recordFailure keys health by quotaKey = family ("codex").
+			for (let i = 0; i < 5; i++) manager.recordFailure(target!, "codex");
+			const penalized = getHealthTracker().getScore(identityKey, "codex");
+			expect(penalized).toBeLessThan(100);
+
+			// Use a LIVE reference for removal: removeAccount matches by object
+			// identity, and the snapshot above is a shallow copy that would not match.
+			const liveTarget = manager.getAccountByIndex(0);
+			expect(liveTarget?.accountId).toBe("acc_stable");
+			expect(manager.removeAccount(liveTarget!)).toBe(true);
+
+			// After removal the identity-keyed health entry is gone, so a fresh lookup
+			// for the same identity returns the default max score (no inherited penalty).
+			const afterRemoval = getHealthTracker().getScore(identityKey, "codex");
+			expect(afterRemoval).toBe(100);
+			expect(afterRemoval).toBeGreaterThan(penalized);
+
+			// Token bucket reset: a fresh lookup for the same identity reports the
+			// full default capacity (the consumed token did not carry over).
+			expect(tokenTracker.getTokens(identityKey, "codex")).toBe(
+				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
+			);
+			// Circuit breaker reset: a fresh breaker for the same identity is closed.
+			expect(getCircuitBreaker(breakerKey).getState()).toBe("closed");
+		});
+
+		// Regression (accounts-02 / phase-1): tracker state is WRITTEN under the
+		// pinned getRuntimeTrackerKey, which stays STABLE across later identity
+		// enrichment. Removal cleanup must clear that stable key, NOT the recomputed
+		// getRuntimeAccountIdentityKey. When an account is first tracked under an
+		// older key shape (here email-only) and then gains an accountId, the two
+		// keys DIVERGE; clearing only the recomputed key leaves stale health/token
+		// entries behind, so a later re-add inherits stale penalties.
+		it("clears tracker state under the stable tracker key after identity enrichment on removal", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					// Email-only at construction: pinned tracker key will be
+					// "email:<key>" (a string of the pre-enrichment shape), not numeric.
+					{
+						refreshToken: "tok-enrich",
+						email: "stale@example.com",
+						addedAt: now,
+						lastUsed: now,
+					},
+					{ refreshToken: "tok-other", accountId: "acc_other", addedAt: now, lastUsed: now },
+				],
+			};
+			const manager = new AccountManager(undefined, stored);
+
+			const account = manager.getAccountByIndex(0)!;
+			const healthTracker = getHealthTracker();
+			const tokenTracker = getTokenTracker();
+
+			// Pin + capture the stable tracker key BEFORE enrichment. consumeToken
+			// calls getRuntimeTrackerKey internally, which pins _runtimeTrackerKey.
+			// Consume the token FIRST: the recordFailure loop below opens the circuit
+			// breaker, which would otherwise block consumeToken.
+			expect(manager.consumeToken(account, "codex")).toBe(true);
+			const stableTrackerKey = getRuntimeTrackerKey(account);
+			expect(stableTrackerKey).toBe("email:stale@example.com");
+
+			// Drive health down, all keyed by the stable key.
+			for (let i = 0; i < 5; i++) manager.recordFailure(account, "codex");
+			const penalizedScore = healthTracker.getScore(stableTrackerKey, "codex");
+			expect(penalizedScore).toBeLessThan(100);
+			expect(tokenTracker.getTokens(stableTrackerKey, "codex")).toBeLessThan(
+				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
+			);
+
+			// Enrich identity so the account gains an accountId. The pinned tracker
+			// key stays "email:stale@example.com", but the RECOMPUTED identity key
+			// now folds in the accountId and therefore DIVERGES from it.
+			const payload = Buffer.from(
+				JSON.stringify({
+					email: "stale@example.com",
+					"https://api.openai.com/auth": {
+						chatgpt_account_id: "acc_enriched",
+					},
+					exp: Math.floor((now + 3600000) / 1000),
+				}),
+			).toString("base64url");
+			manager.updateFromAuth(account, {
+				type: "oauth",
+				access: `header.${payload}.signature`,
+				refresh: "tok-enrich-rotated",
+				expires: now + 3600000,
+			});
+			expect(account.accountId).toBe("acc_enriched");
+			expect(getRuntimeTrackerKey(account)).toBe(stableTrackerKey);
+			// Crux of the bug: recomputed identity key differs from the stable one.
+			expect(getRuntimeAccountIdentityKey(account)).not.toBe(stableTrackerKey);
+
+			// Remove the (live) account. Cleanup must clear the STABLE tracker key.
+			expect(manager.removeAccount(account)).toBe(true);
+
+			// Under the buggy code (clear only the recomputed identity key), the
+			// stale entries under the stable key survive: getScore < 100 and
+			// getTokens < max. The fix clears the stable key, so both reset.
+			expect(healthTracker.getScore(stableTrackerKey, "codex")).toBe(100);
+			expect(tokenTracker.getTokens(stableTrackerKey, "codex")).toBe(
+				DEFAULT_TOKEN_BUCKET_CONFIG.maxTokens,
+			);
+		});
+
+		it("returns false when removing non-existent account", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const fakeAccount = {
+				index: 999,
+				refreshToken: "non-existent",
+				addedAt: now,
+				lastUsed: now,
+				rateLimitResetTimes: {},
+			};
+
+			const removed = manager.removeAccount(fakeAccount as any);
+			expect(removed).toBe(false);
+			expect(manager.getAccountCount()).toBe(1);
+		});
+
+		it("handles removing the last account", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount();
+			expect(account).not.toBe(null);
+
+			const removed = manager.removeAccount(account!);
+			expect(removed).toBe(true);
+			expect(manager.getAccountCount()).toBe(0);
+			expect(manager.getCurrentAccount()).toBe(null);
+		});
+	});
+
+	describe("hasRefreshToken", () => {
+		it("returns true when token exists", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			expect(manager.hasRefreshToken("token-1")).toBe(true);
+			expect(manager.hasRefreshToken("token-2")).toBe(true);
+		});
+
+		it("returns false when token does not exist", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			expect(manager.hasRefreshToken("non-existent")).toBe(false);
+			expect(manager.hasRefreshToken("")).toBe(false);
+		});
+	});
+
+	describe("markRateLimitedWithReason", () => {
+		it("marks account as rate limited with reason", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			manager.markRateLimitedWithReason(account, 60000, "codex", "quota");
+
+			expect(account.lastRateLimitReason).toBe("quota");
+			expect(account.rateLimitResetTimes["codex"]).toBeDefined();
+		});
+
+		it("H1: clamps an absurd retry-after value to MAX_RATE_LIMIT_DELAY_MS (7d)", () => {
+			const now = new Date("2026-04-05T00:00:00.000Z");
+			vi.useFakeTimers();
+			vi.setSystemTime(now);
+			try {
+				const stored = {
+					version: 3 as const,
+					activeIndex: 0,
+					accounts: [{ refreshToken: "token-1", addedAt: now.getTime(), lastUsed: now.getTime() }],
+				};
+				const manager = new AccountManager(undefined, stored);
+				const account = manager.getCurrentAccount()!;
+				// Hostile/buggy upstream: ~31 years in ms.
+				manager.markRateLimitedWithReason(account, 999_999_999_999, "codex", "quota");
+				const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+				const resetAt = account.rateLimitResetTimes["codex"]!;
+				// Window must not exceed 7 days from now.
+				expect(resetAt - now.getTime()).toBeLessThanOrEqual(sevenDaysMs);
+				expect(resetAt - now.getTime()).toBe(sevenDaysMs);
+				// And the clamped window is in the past after 7d+ elapses (self-heals).
+				vi.advanceTimersByTime(sevenDaysMs + 1000);
+				expect(account.rateLimitResetTimes["codex"]!).toBeLessThan(Date.now());
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("scopes token rate limits to the model-specific key", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			manager.markRateLimitedWithReason(
+				account,
+				60000,
+				"codex",
+				"tokens",
+				"gpt-5.2",
+			);
+
+			expect(account.rateLimitResetTimes["codex"]).toBeUndefined();
+			expect(account.rateLimitResetTimes["codex:gpt-5.2"]).toBeDefined();
+		});
+
+		it("does not shorten an existing reset when a later retry window is smaller", () => {
+			vi.useFakeTimers();
+			try {
+				const now = new Date("2026-04-05T00:00:00.000Z");
+				vi.setSystemTime(now);
+				const stored = {
+					version: 3 as const,
+					activeIndex: 0,
+					accounts: [
+						{
+							refreshToken: "token-1",
+							addedAt: now.getTime(),
+							lastUsed: now.getTime(),
+						},
+					],
+				};
+
+				const manager = new AccountManager(undefined, stored);
+				const account = manager.getCurrentAccount()!;
+				manager.markRateLimitedWithReason(
+					account,
+					90 * 60_000,
+					"codex",
+					"quota",
+				);
+
+				const expectedResetAt = now.getTime() + 90 * 60_000;
+
+				vi.advanceTimersByTime(30 * 60_000);
+
+				manager.markRateLimitedWithReason(account, 60_000, "codex", "quota");
+
+				expect(account.rateLimitResetTimes["codex"]).toBe(expectedResetAt);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("does not shorten an existing model-scoped reset when a later retry window is smaller", () => {
+			vi.useFakeTimers();
+			try {
+				const now = new Date("2026-04-05T00:00:00.000Z");
+				vi.setSystemTime(now);
+				const stored = {
+					version: 3 as const,
+					activeIndex: 0,
+					accounts: [
+						{
+							refreshToken: "token-1",
+							addedAt: now.getTime(),
+							lastUsed: now.getTime(),
+						},
+					],
+				};
+
+				const manager = new AccountManager(undefined, stored);
+				const account = manager.getCurrentAccount()!;
+				manager.markRateLimitedWithReason(
+					account,
+					90 * 60_000,
+					"codex",
+					"tokens",
+					"gpt-5.2",
+				);
+
+				const expectedResetAt = now.getTime() + 90 * 60_000;
+
+				vi.advanceTimersByTime(30 * 60_000);
+
+				manager.markRateLimitedWithReason(
+					account,
+					60_000,
+					"codex",
+					"tokens",
+					"gpt-5.2",
+				);
+
+				expect(account.rateLimitResetTimes["codex:gpt-5.2"]).toBe(
+					expectedResetAt,
+				);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+	});
+
+	describe("cooldown management", () => {
+		it("marks account as cooling down", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			manager.markAccountCoolingDown(account, 30000, "auth-failure");
+
+			expect(manager.isAccountCoolingDown(account)).toBe(true);
+			expect(account.cooldownReason).toBe("auth-failure");
+		});
+
+		it("clears cooldown when time expires", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "token-1",
+						addedAt: now,
+						lastUsed: now,
+						coolingDownUntil: now - 1000,
+					},
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			expect(manager.isAccountCoolingDown(account)).toBe(false);
+		});
+
+		it("clears cooldown manually", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			manager.markAccountCoolingDown(account, 30000, "network-error");
+			expect(manager.isAccountCoolingDown(account)).toBe(true);
+
+			manager.clearAccountCooldown(account);
+			expect(manager.isAccountCoolingDown(account)).toBe(false);
+			expect(account.cooldownReason).toBeUndefined();
+		});
+	});
+
+	describe("clearAccountTransientState", () => {
+		it("clears active cooldowns on every account", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const first = manager.getAccountByIndex(0)!;
+			const second = manager.getAccountByIndex(1)!;
+			manager.markAccountCoolingDown(first, 60_000, "network-error");
+			manager.markAccountCoolingDown(second, 60_000, "server-error");
+
+			manager.clearAccountTransientState();
+
+			expect(manager.isAccountCoolingDown(first)).toBe(false);
+			expect(manager.isAccountCoolingDown(second)).toBe(false);
+			expect(first.coolingDownUntil).toBeUndefined();
+			expect(first.cooldownReason).toBeUndefined();
+			expect(second.coolingDownUntil).toBeUndefined();
+			expect(second.cooldownReason).toBeUndefined();
+		});
+
+		it("clears all rate-limit reset windows, including ones still in the future", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			manager.markRateLimitedWithReason(account, 60_000, "codex", "quota");
+			manager.markRateLimitedWithReason(
+				account,
+				60_000,
+				"codex",
+				"tokens",
+				"gpt-5.2",
+			);
+			expect(Object.keys(account.rateLimitResetTimes).length).toBeGreaterThan(0);
+			expect(account.lastRateLimitReason).toBe("tokens");
+
+			manager.clearAccountTransientState();
+
+			expect(account.rateLimitResetTimes).toEqual({});
+			expect(account.lastRateLimitReason).toBeUndefined();
+		});
+
+		it("clears cooldown and rate-limit state together on the same account", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			// A real stuck account from #606 carries both states at once; prove the
+			// method clears both in one pass rather than short-circuiting.
+			manager.markAccountCoolingDown(account, 60_000, "server-error");
+			manager.markRateLimitedWithReason(account, 60_000, "codex", "quota");
+			expect(manager.isAccountCoolingDown(account)).toBe(true);
+			expect(Object.keys(account.rateLimitResetTimes).length).toBeGreaterThan(0);
+
+			manager.clearAccountTransientState();
+
+			expect(account.coolingDownUntil).toBeUndefined();
+			expect(account.cooldownReason).toBeUndefined();
+			expect(account.rateLimitResetTimes).toEqual({});
+			expect(account.lastRateLimitReason).toBeUndefined();
+		});
+
+		it("clears mixed per-account state without throwing on clean accounts", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-3", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const coolingDown = manager.getAccountByIndex(0)!;
+			const rateLimited = manager.getAccountByIndex(1)!;
+			const clean = manager.getAccountByIndex(2)!;
+			manager.markAccountCoolingDown(coolingDown, 60_000, "network-error");
+			manager.markRateLimitedWithReason(rateLimited, 60_000, "codex", "quota");
+
+			expect(() => manager.clearAccountTransientState()).not.toThrow();
+
+			expect(coolingDown.coolingDownUntil).toBeUndefined();
+			expect(rateLimited.rateLimitResetTimes).toEqual({});
+			expect(clean.coolingDownUntil).toBeUndefined();
+			expect(clean.rateLimitResetTimes).toEqual({});
+		});
+
+		it("persists the cleared pool so a reload does not restore stale state", async () => {
+			const { saveAccounts } = await import("../lib/storage.js");
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			mockSaveAccounts.mockClear();
+
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			manager.markAccountCoolingDown(account, 60_000, "server-error");
+			manager.markRateLimitedWithReason(account, 60_000, "codex", "quota");
+
+			manager.clearAccountTransientState();
+			// Flush so we assert against the actual persisted snapshot, not just
+			// that a save was scheduled — this is the #606 durability guarantee.
+			await manager.flushPendingSave();
+
+			expect(mockSaveAccounts).toHaveBeenCalledTimes(1);
+			const persisted = mockSaveAccounts.mock.calls[0]?.[0];
+			expect(persisted?.accounts[0]?.coolingDownUntil).toBeUndefined();
+			expect(persisted?.accounts[0]?.cooldownReason).toBeUndefined();
+			expect(persisted?.accounts[0]?.rateLimitResetTimes ?? {}).toEqual({});
+		});
+
+		it("is a no-op when no accounts are loaded", () => {
+			const manager = new AccountManager(undefined, {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [],
+			});
+			const saveSpy = vi.spyOn(manager, "saveToDiskDebounced");
+
+			expect(() => manager.clearAccountTransientState()).not.toThrow();
+			expect(saveSpy).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("auth failure tracking", () => {
+		it.each([
+			["zero", 0],
+			["negative", -1],
+			["NaN", Number.NaN],
+			["infinity", Number.POSITIVE_INFINITY],
+		] as const)("does not treat %s as an auth invalidation", (_label, timestamp) => {
+			const now = Date.now();
+			const manager = new AccountManager(undefined, {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "token-1",
+						addedAt: now,
+						lastUsed: now,
+						authInvalidatedAt: timestamp,
+					},
+				],
+			});
+			const account = manager.getCurrentAccount();
+			if (!account) throw new Error("account missing");
+
+			expect(manager.isAccountAuthInvalidated(account)).toBe(false);
+		});
+
+		it("treats a positive finite timestamp as an auth invalidation", () => {
+			const now = Date.now();
+			const manager = new AccountManager(undefined, {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "token-1",
+						addedAt: now,
+						lastUsed: now,
+						authInvalidatedAt: now,
+					},
+				],
+			});
+			const account = manager.getCurrentAccount();
+			if (!account) throw new Error("account missing");
+
+			expect(manager.isAccountAuthInvalidated(account)).toBe(true);
+		});
+
+		it("increments consecutive auth failures", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+
+			expect(manager.incrementAuthFailures(account)).toBe(1);
+			expect(manager.incrementAuthFailures(account)).toBe(2);
+			expect(manager.incrementAuthFailures(account)).toBe(3);
+		});
+
+		it("clears auth failures", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+
+			manager.incrementAuthFailures(account);
+			manager.incrementAuthFailures(account);
+			manager.clearAuthFailures(account);
+
+			expect(account.consecutiveAuthFailures).toBe(0);
+		});
+	});
+
+	describe("getMinWaitTimeForFamily", () => {
+		it("returns 0 when accounts are available", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			expect(manager.getMinWaitTimeForFamily("codex")).toBe(0);
+		});
+
+		it("returns wait time when all accounts rate limited", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "token-1",
+						addedAt: now,
+						lastUsed: now,
+						rateLimitResetTimes: { codex: now + 30000 },
+					},
+					{
+						refreshToken: "token-2",
+						addedAt: now,
+						lastUsed: now,
+						rateLimitResetTimes: { codex: now + 60000 },
+					},
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const waitTime = manager.getMinWaitTimeForFamily("codex");
+			expect(waitTime).toBeGreaterThan(0);
+			expect(waitTime).toBeLessThanOrEqual(30000);
+		});
+
+		it("considers model-specific rate limits", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "token-1",
+						addedAt: now,
+						lastUsed: now,
+						rateLimitResetTimes: { "codex:gpt-5.2": now + 45000 },
+					},
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const waitTime = manager.getMinWaitTimeForFamily("codex", "gpt-5.2");
+			expect(waitTime).toBeGreaterThan(0);
+			expect(waitTime).toBeLessThanOrEqual(45000);
+		});
+	});
+
+	describe("updateFromAuth", () => {
+		it("updates account tokens from auth", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "old-token", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+
+			const newAuth: OAuthAuthDetails = {
+				type: "oauth",
+				access: "new-access",
+				refresh: "new-refresh",
+				expires: now + 3600000,
+			};
+
+			manager.updateFromAuth(account, newAuth);
+
+			expect(account.refreshToken).toBe("new-refresh");
+			expect(account.access).toBe("new-access");
+			expect(account.expires).toBe(now + 3600000);
+		});
+
+		it("updates accountId from token when source is token-derived", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "old-token",
+						addedAt: now,
+						lastUsed: now,
+						accountId: "old-account-id",
+						accountIdSource: "token" as const,
+					},
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+
+			const payload = Buffer.from(
+				JSON.stringify({
+					"https://api.openai.com/auth": {
+						chatgpt_account_id: "new-account-id-from-token",
+					},
+					exp: Math.floor((now + 3600000) / 1000),
+				}),
+			).toString("base64url");
+			const accessToken = `header.${payload}.signature`;
+
+			const newAuth: OAuthAuthDetails = {
+				type: "oauth",
+				access: accessToken,
+				refresh: "new-refresh",
+				expires: now + 3600000,
+			};
+
+			manager.updateFromAuth(account, newAuth);
+
+			expect(account.accountId).toBe("new-account-id-from-token");
+			expect(account.accountIdSource).toBe("token");
+		});
+
+		it("does not update accountId when source is org-selected", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "old-token",
+						addedAt: now,
+						lastUsed: now,
+						accountId: "org-selected-id",
+						accountIdSource: "org" as const,
+					},
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+
+			const payload = Buffer.from(
+				JSON.stringify({
+					"https://api.openai.com/auth": {
+						chatgpt_account_id: "new-account-id-from-token",
+					},
+					exp: Math.floor((now + 3600000) / 1000),
+				}),
+			).toString("base64url");
+			const accessToken = `header.${payload}.signature`;
+
+			const newAuth: OAuthAuthDetails = {
+				type: "oauth",
+				access: accessToken,
+				refresh: "new-refresh",
+				expires: now + 3600000,
+			};
+
+			manager.updateFromAuth(account, newAuth);
+
+			expect(account.accountId).toBe("org-selected-id");
+			expect(account.accountIdSource).toBe("org");
+		});
+	});
+
+	describe("commitRefreshedAuth", () => {
+		it("persists refreshed auth transactionally and updates the live account", async () => {
+			const { withAccountStorageTransaction } = await import(
+				"../lib/storage.js"
+			);
+			const mockWithAccountStorageTransaction = vi.mocked(
+				withAccountStorageTransaction,
+			);
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "old-refresh",
+						accessToken: "old-access",
+						expiresAt: now,
+						addedAt: now,
+						lastUsed: now,
+						email: "old@example.com",
+						accountId: "old-account-id",
+						accountIdSource: "token" as const,
+						enabled: false,
+						coolingDownUntil: now + 30_000,
+						cooldownReason: "auth-failure" as const,
+					},
+				],
+			};
+			const manager = new AccountManager(undefined, stored as any);
+			const account = manager.getAccountByIndex(0)!;
+			account.enabled = false;
+			manager.markAccountCoolingDown(account, 30_000, "auth-failure");
+			manager.incrementAuthFailures(account);
+
+			const payload = Buffer.from(
+				JSON.stringify({
+					email: "new@example.com",
+					"https://api.openai.com/auth": {
+						chatgpt_account_id: "new-account-id",
+					},
+				}),
+			).toString("base64url");
+			const refreshedAuth: OAuthAuthDetails = {
+				type: "oauth",
+				access: `header.${payload}.signature`,
+				refresh: "new-refresh",
+				expires: now + 3_600_000,
+			};
+
+			mockWithAccountStorageTransaction.mockImplementationOnce(
+				async (handler) => {
+					const persist = vi.fn().mockResolvedValue(undefined);
+					const result = await handler(stored as any, persist);
+
+					expect(persist).toHaveBeenCalledTimes(1);
+					const persistedStorage = persist.mock.calls[0]?.[0];
+					expect(persistedStorage?.accounts[0]?.refreshToken).toBe(
+						"new-refresh",
+					);
+					expect(persistedStorage?.accounts[0]?.accessToken).toBe(
+						refreshedAuth.access,
+					);
+					expect(persistedStorage?.accounts[0]?.expiresAt).toBe(
+						refreshedAuth.expires,
+					);
+					expect(persistedStorage?.accounts[0]?.accountId).toBe(
+						"new-account-id",
+					);
+					expect(persistedStorage?.accounts[0]?.accountIdSource).toBe("token");
+					expect(persistedStorage?.accounts[0]?.email).toBe("new@example.com");
+					expect(persistedStorage?.accounts[0]?.enabled).toBeUndefined();
+					expect(
+						persistedStorage?.accounts[0]?.coolingDownUntil,
+					).toBeUndefined();
+					expect(persistedStorage?.accounts[0]?.cooldownReason).toBeUndefined();
+
+					return result;
+				},
+			);
+
+			const updated = await manager.commitRefreshedAuth(account, refreshedAuth);
+
+			expect(updated).toBe(account);
+			expect(account.refreshToken).toBe("new-refresh");
+			expect(account.access).toBe(refreshedAuth.access);
+			expect(account.expires).toBe(refreshedAuth.expires);
+			expect(account.accountId).toBe("new-account-id");
+			expect(account.accountIdSource).toBe("token");
+			expect(account.email).toBe("new@example.com");
+			expect(account.enabled).toBe(true);
+			expect(account.coolingDownUntil).toBeUndefined();
+			expect(account.cooldownReason).toBeUndefined();
+			expect(account.consecutiveAuthFailures).toBe(0);
+		});
+
+		it("preserves unsaved live pool state when persisting refreshed auth", async () => {
+			const { withAccountStorageTransaction } = await import(
+				"../lib/storage.js"
+			);
+			const mockWithAccountStorageTransaction = vi.mocked(
+				withAccountStorageTransaction,
+			);
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				activeIndexByFamily: {
+					codex: 0,
+				},
+				accounts: [
+					{
+						refreshToken: "old-refresh-a",
+						accessToken: "old-access-a",
+						expiresAt: now,
+						addedAt: now,
+						lastUsed: now,
+						email: "a@example.com",
+					},
+					{
+						refreshToken: "old-refresh-b",
+						accessToken: "old-access-b",
+						expiresAt: now,
+						addedAt: now,
+						lastUsed: now,
+						email: "b@example.com",
+					},
+				],
+			};
+			const manager = new AccountManager(undefined, stored as any);
+			const accountA = manager.getAccountByIndex(0)!;
+			const accountB = manager.getAccountByIndex(1)!;
+			manager.markSwitched(accountB, "rotation", "codex");
+			manager.markRateLimited(accountB, 45_000, "codex");
+			manager.markAccountCoolingDown(accountB, 30_000, "network-error");
+
+			const refreshedAuth: OAuthAuthDetails = {
+				type: "oauth",
+				access: "header.payload.signature",
+				refresh: "new-refresh-a",
+				expires: now + 3_600_000,
+			};
+
+			mockWithAccountStorageTransaction.mockImplementationOnce(
+				async (handler) => {
+					const persist = vi.fn().mockResolvedValue(undefined);
+					const result = await handler(stored as any, persist);
+
+					expect(persist).toHaveBeenCalledTimes(1);
+					const persistedStorage = persist.mock.calls[0]?.[0];
+					expect(persistedStorage?.activeIndex).toBe(1);
+					expect(persistedStorage?.activeIndexByFamily?.codex).toBe(1);
+					expect(persistedStorage?.accounts[0]?.refreshToken).toBe(
+						"new-refresh-a",
+					);
+					expect(
+						persistedStorage?.accounts[1]?.rateLimitResetTimes?.codex,
+					).toBeGreaterThan(now);
+					expect(persistedStorage?.accounts[1]?.cooldownReason).toBe(
+						"network-error",
+					);
+					expect(
+						persistedStorage?.accounts[1]?.coolingDownUntil,
+					).toBeGreaterThan(now);
+
+					return result;
+				},
+			);
+
+			await manager.commitRefreshedAuth(accountA, refreshedAuth);
+		});
+
+		it("keeps trimmed token accountId identical in memory and persisted storage", async () => {
+			const { withAccountStorageTransaction } = await import(
+				"../lib/storage.js"
+			);
+			const mockWithAccountStorageTransaction = vi.mocked(
+				withAccountStorageTransaction,
+			);
+			const now = Date.now();
+			const payload = Buffer.from(
+				JSON.stringify({
+					"https://api.openai.com/auth": {
+						chatgpt_account_id: "  matching-account-id  ",
+					},
+				}),
+			).toString("base64url");
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "old-refresh",
+						accessToken: "old-access",
+						expiresAt: now,
+						addedAt: now,
+						lastUsed: now,
+						accountId: "matching-account-id",
+						accountIdSource: "token" as const,
+					},
+				],
+			};
+			const manager = new AccountManager(undefined, stored as any);
+			const account = manager.getAccountByIndex(0)!;
+			const refreshedAuth: OAuthAuthDetails = {
+				type: "oauth",
+				access: `header.${payload}.signature`,
+				refresh: "new-refresh",
+				expires: now + 3_600_000,
+			};
+
+			mockWithAccountStorageTransaction.mockImplementationOnce(
+				async (handler) => {
+					const persist = vi.fn().mockResolvedValue(undefined);
+					const result = await handler(stored as any, persist);
+
+					expect(persist).toHaveBeenCalledTimes(1);
+					const persistedStorage = persist.mock.calls[0]?.[0];
+					expect(persistedStorage?.accounts[0]?.accountId).toBe(
+						"matching-account-id",
+					);
+
+					return result;
+				},
+			);
+
+			await manager.commitRefreshedAuth(account, refreshedAuth);
+
+			expect(account.accountId).toBe("matching-account-id");
+		});
+
+		it("propagates storage write failure as retryable CodexAuthError", async () => {
+			const { withAccountStorageTransaction } = await import(
+				"../lib/storage.js"
+			);
+			const mockWithAccountStorageTransaction = vi.mocked(
+				withAccountStorageTransaction,
+			);
+			mockWithAccountStorageTransaction.mockRejectedValueOnce(
+				Object.assign(new Error("EBUSY"), { code: "EBUSY" }),
+			);
+
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "old-refresh",
+						accessToken: "old-access",
+						expiresAt: now,
+						addedAt: now,
+						lastUsed: now,
+					},
+				],
+			};
+			const manager = new AccountManager(undefined, stored as any);
+			const account = manager.getAccountByIndex(0)!;
+			const refreshedAuth: OAuthAuthDetails = {
+				type: "oauth",
+				access: "header.payload.signature",
+				refresh: "new-refresh",
+				expires: now + 3_600_000,
+			};
+
+			const error = await manager
+				.commitRefreshedAuth(account, refreshedAuth)
+				.catch((err) => err as CodexAuthError);
+
+			expect(error).toBeInstanceOf(CodexAuthError);
+			expect(error.retryable).toBe(true);
+			expect(account.refreshToken).toBe("old-refresh");
+		});
+
+		it("propagates non-transient storage write failure as terminal CodexAuthError", async () => {
+			const { withAccountStorageTransaction } = await import(
+				"../lib/storage.js"
+			);
+			const mockWithAccountStorageTransaction = vi.mocked(
+				withAccountStorageTransaction,
+			);
+			mockWithAccountStorageTransaction.mockRejectedValueOnce(
+				Object.assign(new Error("EACCES"), { code: "EACCES" }),
+			);
+
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "old-refresh",
+						accessToken: "old-access",
+						expiresAt: now,
+						addedAt: now,
+						lastUsed: now,
+					},
+				],
+			};
+			const manager = new AccountManager(undefined, stored as any);
+			const account = manager.getAccountByIndex(0)!;
+			const refreshedAuth: OAuthAuthDetails = {
+				type: "oauth",
+				access: "header.payload.signature",
+				refresh: "new-refresh",
+				expires: now + 3_600_000,
+			};
+
+			const error = await manager
+				.commitRefreshedAuth(account, refreshedAuth)
+				.catch((err) => err as CodexAuthError);
+
+			expect(error).toBeInstanceOf(CodexAuthError);
+			expect(error.retryable).toBe(false);
+			expect(account.refreshToken).toBe("old-refresh");
+		});
+
+		it("prevents debounced saves from writing stale auth during refresh persistence", async () => {
+			vi.useFakeTimers();
+			try {
+				const { saveAccounts, withAccountStorageTransaction } = await import(
+					"../lib/storage.js"
+				);
+				const mockSaveAccounts = vi.mocked(saveAccounts);
+				const mockWithAccountStorageTransaction = vi.mocked(
+					withAccountStorageTransaction,
+				);
+
+				const now = Date.now();
+				const stored = {
+					version: 3 as const,
+					activeIndex: 0,
+					accounts: [
+						{
+							refreshToken: "old-refresh",
+							accessToken: "old-access",
+							expiresAt: now,
+							addedAt: now,
+							lastUsed: now,
+						},
+					],
+				};
+				const manager = new AccountManager(undefined, stored as any);
+				const account = manager.getAccountByIndex(0)!;
+				const refreshedAuth: OAuthAuthDetails = {
+					type: "oauth",
+					access: "new-access",
+					refresh: "new-refresh",
+					expires: now + 3_600_000,
+				};
+
+				let storageState = structuredClone(stored) as typeof stored;
+				let lock = Promise.resolve();
+				let releasePersist!: () => void;
+				const persistBlocked = new Promise<void>((resolve) => {
+					releasePersist = resolve;
+				});
+				let notifyPersistStarted!: () => void;
+				const persistStarted = new Promise<void>((resolve) => {
+					notifyPersistStarted = resolve;
+				});
+
+				mockWithAccountStorageTransaction.mockImplementation((handler) => {
+					const run = async () => {
+						const current = structuredClone(
+							storageState,
+						) as typeof storageState;
+						const persist = async (
+							nextStorage: Parameters<typeof saveAccounts>[0],
+						) => {
+							if (
+								nextStorage.accounts[0]?.refreshToken === "new-refresh" &&
+								nextStorage.accounts[0]?.accessToken === "new-access"
+							) {
+								notifyPersistStarted();
+								await persistBlocked;
+							}
+							storageState = structuredClone(
+								nextStorage,
+							) as typeof storageState;
+							await mockSaveAccounts(nextStorage);
+						};
+						return handler(current as never, persist);
+					};
+
+					const result = lock.then(run, run);
+					lock = result.then(
+						() => undefined,
+						() => undefined,
+					);
+					return result;
+				});
+
+				const commitPromise = manager.commitRefreshedAuth(
+					account,
+					refreshedAuth,
+				);
+				await persistStarted;
+
+				manager.saveToDiskDebounced(0);
+				await vi.advanceTimersByTimeAsync(0);
+
+				releasePersist();
+				await commitPromise;
+				await manager.flushPendingSave();
+
+				expect(mockSaveAccounts).toHaveBeenCalledTimes(2);
+				expect(
+					mockSaveAccounts.mock.calls[0]?.[0]?.accounts[0]?.refreshToken,
+				).toBe("new-refresh");
+				expect(
+					mockSaveAccounts.mock.calls[1]?.[0]?.accounts[0]?.refreshToken,
+				).toBe("new-refresh");
+				expect(
+					mockSaveAccounts.mock.calls[1]?.[0]?.accounts[0]?.accessToken,
+				).toBe("new-access");
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+	});
+
+	describe("toAuthDetails", () => {
+		it("converts account to Auth object", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			account.access = "access-token";
+			account.expires = now + 3600000;
+
+			const auth = manager.toAuthDetails(account);
+
+			expect(auth.type).toBe("oauth");
+			if (auth.type === "oauth") {
+				expect(auth.access).toBe("access-token");
+				expect(auth.refresh).toBe("token-1");
+				expect(auth.expires).toBe(now + 3600000);
+			}
+		});
+
+		it("handles missing access token", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+
+			const auth = manager.toAuthDetails(account);
+
+			expect(auth.type).toBe("oauth");
+			if (auth.type === "oauth") {
+				expect(auth.access).toBe("");
+				expect(auth.expires).toBe(0);
+			}
+		});
+	});
+
+	describe("setActiveIndex", () => {
+		it("sets active index and returns account", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const result = manager.setActiveIndex(1);
+
+			expect(result?.refreshToken).toBe("token-2");
+			expect(manager.getActiveIndex()).toBe(1);
+		});
+
+		it("returns null for invalid index", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			expect(manager.setActiveIndex(-1)).toBeNull();
+			expect(manager.setActiveIndex(999)).toBeNull();
+			expect(manager.setActiveIndex(NaN)).toBeNull();
+			expect(manager.setActiveIndex(Infinity)).toBeNull();
+		});
+	});
+
+	describe("markSwitched", () => {
+		it("records switch reason on account", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+
+			manager.markSwitched(account, "rate-limit", "codex");
+			expect(account.lastSwitchReason).toBe("rate-limit");
+		});
+
+		it("syncs cursorByFamily past the just-switched account (HI-02)", () => {
+			// Regression: markSwitched used to only update
+			// currentAccountIndexByFamily, leaving cursorByFamily pointing at
+			// the pre-switch position. The next round-robin pass would then
+			// start from the stale cursor instead of advancing past the
+			// freshly marked account.
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{ refreshToken: "token-0", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+
+			// Walk the cursor to a known non-zero position: first rotation
+			// returns index 0 and advances cursor to 1.
+			expect(manager.getCurrentOrNextForFamily("codex")?.refreshToken).toBe(
+				"token-0",
+			);
+
+			const account2 = manager.getAccountByIndex(2)!;
+			manager.markSwitched(account2, "rate-limit", "codex");
+
+			// Active pointer moved to 2.
+			expect(manager.getCurrentAccountForFamily("codex")?.refreshToken).toBe(
+				"token-2",
+			);
+
+			// Cursor must advance to (2+1)%3 = 0 so the next rotation starts
+			// AFTER the just-switched account. Without the fix, cursor would
+			// still be at 1 and the next call would return token-1, skipping
+			// the round-robin intent of marking index 2.
+			expect(manager.getCurrentOrNextForFamily("codex")?.refreshToken).toBe(
+				"token-0",
+			);
+		});
+
+		it("syncs cursorByFamily in the mutex-serialized markSwitchedLocked path", async () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{ refreshToken: "token-0", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored, {
+				routingMutexMode: "enabled",
+			});
+
+			expect(manager.getCurrentOrNextForFamily("codex")?.refreshToken).toBe(
+				"token-0",
+			);
+
+			const account2 = manager.getAccountByIndex(2)!;
+			await manager.markSwitchedLocked(account2, "rate-limit", "codex");
+
+			expect(manager.getCurrentAccountForFamily("codex")?.refreshToken).toBe(
+				"token-2",
+			);
+			expect(manager.getCurrentOrNextForFamily("codex")?.refreshToken).toBe(
+				"token-0",
+			);
+		});
+	});
+
+		describe("saveToDisk", () => {
+		it("saves accounts with all fields", async () => {
+			const { saveAccounts } = await import("../lib/storage.js");
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			mockSaveAccounts.mockResolvedValueOnce();
+
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "token-1",
+						addedAt: now,
+						lastUsed: now,
+						email: "test@example.com",
+						accountId: "acc123",
+						accountLabel: "Test",
+						rateLimitResetTimes: { quota: now + 60000 },
+						coolingDownUntil: now + 30000,
+						cooldownReason: "transient",
+					},
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored as any);
+			await manager.saveToDisk();
+
+			expect(mockSaveAccounts).toHaveBeenCalled();
+			const savedData = mockSaveAccounts.mock.calls[0]?.[0];
+			expect(savedData?.version).toBe(3);
+			expect(savedData?.accounts[0]?.email).toBe("test@example.com");
+			expect(savedData?.accounts[0]?.rateLimitResetTimes).toBeDefined();
+		});
+
+		it("omits malformed auth invalidation markers from routine saves", async () => {
+			const { saveAccounts } = await import("../lib/storage.js");
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			const now = Date.now();
+			const manager = new AccountManager(undefined, {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "token-1",
+						addedAt: now,
+						lastUsed: now,
+						authInvalidatedAt: 0,
+						authInvalidationErrorCode: "oauth_token_revoked",
+					},
+				],
+			});
+
+			await manager.saveToDisk();
+
+			const savedAccount = mockSaveAccounts.mock.calls[0]?.[0]?.accounts[0];
+			expect(savedAccount?.authInvalidatedAt).toBeUndefined();
+			expect(savedAccount?.authInvalidationErrorCode).toBeUndefined();
+		});
+
+		it("preserves an invalidation written by another manager before a stale routine save", async () => {
+			const { saveAccounts, withAccountStorageTransaction } = await import(
+				"../lib/storage.js"
+			);
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			const mockWithAccountStorageTransaction = vi.mocked(
+				withAccountStorageTransaction,
+			);
+			let disk: AccountStorageV3 | null = null;
+			mockWithAccountStorageTransaction.mockImplementation(async (handler) => {
+				const persist = async (storage: AccountStorageV3) => {
+					disk = structuredClone(storage);
+					await mockSaveAccounts(storage);
+				};
+				return handler(disk ? structuredClone(disk) : null, persist);
+			});
+
+			const now = Date.now();
+			const initialStorage: AccountStorageV3 = {
+				version: 3,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "shared-refresh-token",
+						email: "shared@example.com",
+						addedAt: now,
+						lastUsed: now,
+					},
+				],
+			};
+			const managerA = new AccountManager(undefined, structuredClone(initialStorage));
+			const managerB = new AccountManager(undefined, structuredClone(initialStorage));
+
+			const accountA = managerA.getAccountByIndex(0);
+			if (!accountA) throw new Error("manager A account missing");
+			managerA.markAuthInvalidated(accountA, "oauth_token_revoked", now + 1);
+			await managerA.saveToDisk();
+			await managerB.saveToDisk();
+
+			expect(disk?.accounts[0]).toMatchObject({
+				authInvalidatedAt: now + 1,
+				authInvalidationErrorCode: "oauth_token_revoked",
+		});
+		});
+	});
+
+	describe("saveToDiskDebounced", () => {
+		beforeEach(() => {
+			vi.useFakeTimers();
+		});
+
+		afterEach(() => {
+			vi.useRealTimers();
+		});
+
+		it("debounces multiple calls", async () => {
+			const { saveAccounts } = await import("../lib/storage.js");
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			mockSaveAccounts.mockClear();
+			mockSaveAccounts.mockResolvedValue();
+
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+
+			manager.saveToDiskDebounced(100);
+			manager.saveToDiskDebounced(100);
+			manager.saveToDiskDebounced(100);
+
+			await vi.advanceTimersByTimeAsync(150);
+
+			expect(mockSaveAccounts).toHaveBeenCalledTimes(1);
+		});
+
+		it("logs warning when debounced save fails", async () => {
+			const { saveAccounts } = await import("../lib/storage.js");
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			mockSaveAccounts.mockClear();
+			mockSaveAccounts.mockRejectedValueOnce(new Error("Save failed"));
+
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+
+			manager.saveToDiskDebounced(100);
+			await vi.advanceTimersByTimeAsync(150);
+
+			expect(mockSaveAccounts).toHaveBeenCalledTimes(1);
+		});
+
+		it("awaits existing pendingSave before starting new save", async () => {
+			const { saveAccounts } = await import("../lib/storage.js");
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			mockSaveAccounts.mockClear();
+
+			let resolveFirst: () => void;
+			const firstSave = new Promise<void>((resolve) => {
+				resolveFirst = resolve;
+			});
+			mockSaveAccounts.mockImplementationOnce(() => firstSave);
+			mockSaveAccounts.mockResolvedValue();
+
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+
+			manager.saveToDiskDebounced(50);
+			await vi.advanceTimersByTimeAsync(60);
+
+			manager.saveToDiskDebounced(50);
+			resolveFirst!();
+			await vi.advanceTimersByTimeAsync(100);
+
+			expect(mockSaveAccounts).toHaveBeenCalledTimes(2);
+		});
+
+		it("uses the manager's captured storage path state for delayed saves", async () => {
+			const { saveAccounts, withAccountStorageTransaction } = await import(
+				"../lib/storage.js"
+			);
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			const mockWithAccountStorageTransaction = vi.mocked(
+				withAccountStorageTransaction,
+			);
+			mockSaveAccounts.mockClear();
+
+			vi.useFakeTimers();
+			try {
+				const now = Date.now();
+				const stored = {
+					version: 3 as const,
+					activeIndex: 0,
+					accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+				};
+
+				setStoragePathState({
+					currentStoragePath: "/repo-a/storage.json",
+					currentLegacyProjectStoragePath: null,
+					currentLegacyWorktreeStoragePath: null,
+					currentProjectRoot: "/repo-a",
+				});
+				const manager = new AccountManager(undefined, stored);
+
+				const seenStates: Array<ReturnType<typeof getStoragePathState>> = [];
+				mockWithAccountStorageTransaction.mockImplementationOnce(
+					async (handler) => {
+						seenStates.push({ ...getStoragePathState() });
+						let current = null;
+						const persist = async (
+							storage: Parameters<typeof saveAccounts>[0],
+						) => {
+							current = structuredClone(storage);
+							await mockSaveAccounts(storage);
+						};
+						return handler(current as never, persist);
+					},
+				);
+
+				setStoragePathState({
+					currentStoragePath: "/repo-b/storage.json",
+					currentLegacyProjectStoragePath: null,
+					currentLegacyWorktreeStoragePath: null,
+					currentProjectRoot: "/repo-b",
+				});
+
+				manager.saveToDiskDebounced(50);
+				await vi.advanceTimersByTimeAsync(60);
+
+				expect(seenStates).toEqual([
+					expect.objectContaining({
+						currentStoragePath: "/repo-a/storage.json",
+						currentProjectRoot: "/repo-a",
+					}),
+				]);
+				expect(mockSaveAccounts).toHaveBeenCalledTimes(1);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("uses the manager's captured Windows-style storage path state for delayed saves", async () => {
+			const { saveAccounts, withAccountStorageTransaction } = await import(
+				"../lib/storage.js"
+			);
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			const mockWithAccountStorageTransaction = vi.mocked(
+				withAccountStorageTransaction,
+			);
+			mockSaveAccounts.mockClear();
+
+			const repoAStoragePath = String.raw`C:\repo-a\storage.json`;
+			const repoARoot = String.raw`C:\repo-a`;
+			const repoBStoragePath = String.raw`C:\repo-b\storage.json`;
+			const repoBRoot = String.raw`C:\repo-b`;
+
+			vi.useFakeTimers();
+			try {
+				const now = Date.now();
+				const stored = {
+					version: 3 as const,
+					activeIndex: 0,
+					accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+				};
+
+				setStoragePathState({
+					currentStoragePath: repoAStoragePath,
+					currentLegacyProjectStoragePath: null,
+					currentLegacyWorktreeStoragePath: null,
+					currentProjectRoot: repoARoot,
+				});
+				const manager = new AccountManager(undefined, stored);
+
+				const seenStates: Array<ReturnType<typeof getStoragePathState>> = [];
+				mockWithAccountStorageTransaction.mockImplementationOnce(
+					async (handler) => {
+						seenStates.push({ ...getStoragePathState() });
+						let current = null;
+						const persist = async (
+							storage: Parameters<typeof saveAccounts>[0],
+						) => {
+							current = structuredClone(storage);
+							await mockSaveAccounts(storage);
+						};
+						return handler(current as never, persist);
+					},
+				);
+
+				setStoragePathState({
+					currentStoragePath: repoBStoragePath,
+					currentLegacyProjectStoragePath: null,
+					currentLegacyWorktreeStoragePath: null,
+					currentProjectRoot: repoBRoot,
+				});
+
+				manager.saveToDiskDebounced(50);
+				await vi.advanceTimersByTimeAsync(60);
+
+				expect(seenStates).toEqual([
+					expect.objectContaining({
+						currentStoragePath: repoAStoragePath,
+						currentProjectRoot: repoARoot,
+					}),
+				]);
+				expect(mockSaveAccounts).toHaveBeenCalledTimes(1);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("keeps ambient storage path state stable during concurrent saves", async () => {
+			const { withAccountStorageTransaction } = await import(
+				"../lib/storage.js"
+			);
+			const mockWithAccountStorageTransaction = vi.mocked(
+				withAccountStorageTransaction,
+			);
+			const createDeferred = () => {
+				let resolve!: () => void;
+				const promise = new Promise<void>((resolvePromise) => {
+					resolve = resolvePromise;
+				});
+				return { promise, resolve };
+			};
+			const enteredResolvers = [createDeferred(), createDeferred()];
+			const releaseResolvers = [createDeferred(), createDeferred()];
+			const seenStates: Array<ReturnType<typeof getStoragePathState>> = [];
+			let callIndex = 0;
+
+			mockWithAccountStorageTransaction.mockImplementation(async (handler) => {
+				const currentCall = callIndex;
+				callIndex += 1;
+				seenStates.push({ ...getStoragePathState() });
+				enteredResolvers[currentCall]?.resolve();
+				if (currentCall === 0) {
+					await enteredResolvers[1]?.promise;
+				}
+				await releaseResolvers[currentCall]?.promise;
+				return handler(null, async () => undefined);
+			});
+
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			setStoragePathState({
+				currentStoragePath: "/ambient/storage.json",
+				currentLegacyProjectStoragePath: null,
+				currentLegacyWorktreeStoragePath: null,
+				currentProjectRoot: "/ambient",
+			});
+			setStoragePathState({
+				currentStoragePath: "/repo-a/storage.json",
+				currentLegacyProjectStoragePath: null,
+				currentLegacyWorktreeStoragePath: null,
+				currentProjectRoot: "/repo-a",
+			});
+			const managerA = new AccountManager(undefined, stored);
+			setStoragePathState({
+				currentStoragePath: "/repo-b/storage.json",
+				currentLegacyProjectStoragePath: null,
+				currentLegacyWorktreeStoragePath: null,
+				currentProjectRoot: "/repo-b",
+			});
+			const managerB = new AccountManager(undefined, stored);
+			setStoragePathState({
+				currentStoragePath: "/ambient/storage.json",
+				currentLegacyProjectStoragePath: null,
+				currentLegacyWorktreeStoragePath: null,
+				currentProjectRoot: "/ambient",
+			});
+
+			const saveA = managerA.saveToDisk();
+			await enteredResolvers[0]?.promise;
+			const saveB = managerB.saveToDisk();
+			await enteredResolvers[1]?.promise;
+
+			expect(getStoragePathState()).toEqual(
+				expect.objectContaining({
+					currentStoragePath: "/ambient/storage.json",
+					currentProjectRoot: "/ambient",
+				}),
+			);
+
+			releaseResolvers[0]?.resolve();
+			await saveA;
+			releaseResolvers[1]?.resolve();
+			await saveB;
+
+			expect(seenStates).toEqual([
+				expect.objectContaining({
+					currentStoragePath: "/repo-a/storage.json",
+					currentProjectRoot: "/repo-a",
+				}),
+				expect.objectContaining({
+					currentStoragePath: "/repo-b/storage.json",
+					currentProjectRoot: "/repo-b",
+				}),
+			]);
+			expect(getStoragePathState()).toEqual(
+				expect.objectContaining({
+					currentStoragePath: "/ambient/storage.json",
+					currentProjectRoot: "/ambient",
+				}),
+			);
+		});
+	});
+
+	describe("constructor edge cases", () => {
+		it("filters out accounts with missing refreshToken", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{ refreshToken: "valid-token", addedAt: now, lastUsed: now },
+					{ refreshToken: "", addedAt: now, lastUsed: now },
+					{
+						refreshToken: null as unknown as string,
+						addedAt: now,
+						lastUsed: now,
+					},
+					{
+						refreshToken: undefined as unknown as string,
+						addedAt: now,
+						lastUsed: now,
+					},
+					{ refreshToken: "another-valid", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			expect(manager.getAccountCount()).toBe(2);
+			const accounts = manager.getAccountsSnapshot();
+			expect(accounts[0]?.refreshToken).toBe("valid-token");
+			expect(accounts[1]?.refreshToken).toBe("another-valid");
+		});
+
+		it("merges fallback auth when matching by accountId", () => {
+			const now = Date.now();
+			const payload = {
+				"https://api.openai.com/auth": {
+					chatgpt_account_id: "matching-account-id",
+				},
+				email: "fallback@example.com",
+			};
+			const accessToken = `header.${Buffer.from(JSON.stringify(payload)).toString("base64")}.signature`;
+
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "stored-token",
+						accountId: "matching-account-id",
+						addedAt: now,
+						lastUsed: now,
+					},
+				],
+			};
+
+			const auth: OAuthAuthDetails = {
+				type: "oauth",
+				access: accessToken,
+				refresh: "new-refresh-token",
+				expires: now + 60_000,
+			};
+
+			const manager = new AccountManager(auth, stored);
+			expect(manager.getAccountCount()).toBe(1);
+			const account = manager.getCurrentAccount();
+			expect(account?.refreshToken).toBe("new-refresh-token");
+			expect(account?.access).toBe(accessToken);
+		});
+
+		it("trims fallback accountId before matching and persisting it", () => {
+			const now = Date.now();
+			const payload = {
+				"https://api.openai.com/auth": {
+					chatgpt_account_id: "  matching-account-id  ",
+				},
+			};
+			const accessToken = `header.${Buffer.from(JSON.stringify(payload)).toString("base64")}.signature`;
+
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "stored-token",
+						accountId: "matching-account-id",
+						addedAt: now,
+						lastUsed: now,
+					},
+				],
+			};
+
+			const auth: OAuthAuthDetails = {
+				type: "oauth",
+				access: accessToken,
+				refresh: "new-refresh-token",
+				expires: now + 60_000,
+			};
+
+			const manager = new AccountManager(auth, stored);
+			expect(manager.getAccountCount()).toBe(1);
+			const account = manager.getCurrentAccount();
+			expect(account?.refreshToken).toBe("new-refresh-token");
+			expect(account?.accountId).toBe("matching-account-id");
+		});
+
+		it("ignores malformed stored rows when checking shared accountId uniqueness for fallback matching", () => {
+			const now = Date.now();
+			const payload = {
+				"https://api.openai.com/auth": {
+					chatgpt_account_id: "matching-account-id",
+				},
+			};
+			const accessToken = `header.${Buffer.from(JSON.stringify(payload)).toString("base64")}.signature`;
+
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "stored-token",
+						accountId: "matching-account-id",
+						addedAt: now,
+						lastUsed: now,
+					},
+					{
+						refreshToken: "",
+						accountId: "matching-account-id",
+						addedAt: now,
+						lastUsed: now,
+					},
+					{
+						refreshToken: "   ",
+						accountId: "matching-account-id",
+						addedAt: now,
+						lastUsed: now,
+					},
+				],
+			};
+
+			const auth: OAuthAuthDetails = {
+				type: "oauth",
+				access: accessToken,
+				refresh: "new-refresh-token",
+				expires: now + 60_000,
+			};
+
+			const manager = new AccountManager(auth, stored);
+			expect(manager.getAccountCount()).toBe(1);
+			const account = manager.getCurrentAccount();
+			expect(account?.refreshToken).toBe("new-refresh-token");
+			expect(account?.accountId).toBe("matching-account-id");
+		});
+
+		it("merges fallback auth when matching by email", () => {
+			const now = Date.now();
+			const payload = {
+				email: "fallback@example.com",
+			};
+			const accessToken = `header.${Buffer.from(JSON.stringify(payload)).toString("base64")}.signature`;
+
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "stored-token",
+						email: "fallback@example.com",
+						addedAt: now,
+						lastUsed: now,
+					},
+				],
+			};
+
+			const auth: OAuthAuthDetails = {
+				type: "oauth",
+				access: accessToken,
+				refresh: "new-refresh-token",
+				expires: now + 60_000,
+			};
+
+			const manager = new AccountManager(auth, stored);
+			expect(manager.getAccountCount()).toBe(1);
+			const account = manager.getCurrentAccount();
+			expect(account?.refreshToken).toBe("new-refresh-token");
+			expect(account?.access).toBe(accessToken);
+			expect(account?.email).toBe("fallback@example.com");
+		});
+
+		it("does not add fallback as duplicate when matching stored email", () => {
+			const now = Date.now();
+			const payload = {
+				email: "fallback@example.com",
+			};
+			const accessToken = `header.${Buffer.from(JSON.stringify(payload)).toString("base64")}.signature`;
+
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "stored-token",
+						email: "fallback@example.com",
+						addedAt: now,
+						lastUsed: now,
+					},
+				],
+			};
+
+			const auth: OAuthAuthDetails = {
+				type: "oauth",
+				access: accessToken,
+				refresh: "different-refresh-token",
+				expires: now + 60_000,
+			};
+
+			const manager = new AccountManager(auth, stored);
+			expect(manager.getAccountCount()).toBe(1);
+			const account = manager.getCurrentAccount();
+			expect(account?.refreshToken).toBe("different-refresh-token");
+		});
+
+		it("adds fallback as a distinct account when the same email spans multiple accountIds", () => {
+			const now = Date.now();
+			const payload = {
+				email: "shared@example.com",
+			};
+			const accessToken = `header.${Buffer.from(JSON.stringify(payload)).toString("base64")}.signature`;
+
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						accountId: "workspace-alpha",
+						email: "shared@example.com",
+						refreshToken: "refresh-alpha",
+						addedAt: now,
+						lastUsed: now,
+					},
+					{
+						accountId: "workspace-beta",
+						email: "shared@example.com",
+						refreshToken: "refresh-beta",
+						addedAt: now,
+						lastUsed: now,
+					},
+				],
+			};
+
+			const auth: OAuthAuthDetails = {
+				type: "oauth",
+				access: accessToken,
+				refresh: "refresh-gamma",
+				expires: now + 60_000,
+			};
+
+			const manager = new AccountManager(auth, stored);
+
+			expect(manager.getAccountCount()).toBe(3);
+			expect(
+				manager.getAccountsSnapshot().map((account) => account.refreshToken),
+			).toEqual(["refresh-alpha", "refresh-beta", "refresh-gamma"]);
+		});
+
+		it("adds fallback as new account when no match found", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{ refreshToken: "existing-token", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const auth: OAuthAuthDetails = {
+				type: "oauth",
+				access: "new-access",
+				refresh: "new-refresh",
+				expires: now + 60_000,
+			};
+
+			const manager = new AccountManager(auth, stored);
+			expect(manager.getAccountCount()).toBe(2);
+			const accounts = manager.getAccountsSnapshot();
+			expect(accounts[0]?.refreshToken).toBe("existing-token");
+			expect(accounts[1]?.refreshToken).toBe("new-refresh");
+		});
+
+		it("adds fallback as a distinct account when duplicate business accounts share one accountId", () => {
+			const now = Date.now();
+			const payload = {
+				"https://api.openai.com/auth": {
+					chatgpt_account_id: "workspace-shared",
+				},
+				email: "gamma@example.com",
+			};
+			const accessToken = `header.${Buffer.from(JSON.stringify(payload)).toString("base64")}.signature`;
+
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						accountId: "workspace-shared",
+						email: "alpha@example.com",
+						refreshToken: "refresh-alpha",
+						addedAt: now,
+						lastUsed: now,
+					},
+					{
+						accountId: "workspace-shared",
+						email: "beta@example.com",
+						refreshToken: "refresh-beta",
+						addedAt: now,
+						lastUsed: now,
+					},
+				],
+			};
+
+			const auth: OAuthAuthDetails = {
+				type: "oauth",
+				access: accessToken,
+				refresh: "refresh-gamma",
+				expires: now + 60_000,
+			};
+
+			const manager = new AccountManager(auth, stored);
+
+			expect(manager.getAccountCount()).toBe(3);
+			expect(
+				manager.getAccountsSnapshot().map((account) => account.email),
+			).toEqual(["alpha@example.com", "beta@example.com", "gamma@example.com"]);
+			expect(
+				manager.getAccountsSnapshot().map((account) => account.refreshToken),
+			).toEqual(["refresh-alpha", "refresh-beta", "refresh-gamma"]);
+		});
+
+		it("sets accountIdSource to token when fallbackAccountId exists", () => {
+			const now = Date.now();
+			const payload = {
+				"https://api.openai.com/auth": {
+					chatgpt_account_id: "fallback-id",
+				},
+			};
+			const accessToken = `header.${Buffer.from(JSON.stringify(payload)).toString("base64")}.signature`;
+
+			const auth: OAuthAuthDetails = {
+				type: "oauth",
+				access: accessToken,
+				refresh: "refresh-token",
+				expires: now + 60_000,
+			};
+
+			const manager = new AccountManager(auth, null);
+			expect(manager.getAccountCount()).toBe(1);
+			const account = manager.getCurrentAccount();
+			expect(account?.accountIdSource).toBe("token");
+			expect(account?.accountId).toBe("fallback-id");
+		});
+
+		it("sets accountIdSource to undefined when no accountId in token", () => {
+			const now = Date.now();
+			const auth: OAuthAuthDetails = {
+				type: "oauth",
+				access: "invalid-jwt",
+				refresh: "refresh-token",
+				expires: now + 60_000,
+			};
+
+			const manager = new AccountManager(auth, null);
+			expect(manager.getAccountCount()).toBe(1);
+			const account = manager.getCurrentAccount();
+			expect(account?.accountIdSource).toBeUndefined();
+		});
+	});
+
+	describe("removeAccount cursor adjustment", () => {
+		it("adjusts cursor when removing account before cursor position", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-3", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+
+			manager.getCurrentOrNextForFamily("codex");
+			manager.getCurrentOrNextForFamily("codex");
+			manager.getCurrentOrNextForFamily("codex");
+
+			const firstAccount = manager.getCurrentAccountForFamily("codex");
+			expect(firstAccount).not.toBeNull();
+			const removed = manager.removeAccount(firstAccount!);
+
+			expect(removed).toBe(true);
+			expect(manager.getAccountCount()).toBe(2);
+		});
+
+		it("adjusts currentAccountIndexByFamily when removing account before current", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 2,
+				activeIndexByFamily: { codex: 2 },
+				accounts: [
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-3", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored as never);
+
+			const initialAccount = manager.getCurrentAccountForFamily("codex");
+			expect(initialAccount?.refreshToken).toBe("token-3");
+
+			manager.setActiveIndex(0);
+			const accountToRemove = manager.getCurrentAccountForFamily("codex");
+			expect(accountToRemove?.refreshToken).toBe("token-1");
+
+			manager.setActiveIndex(2);
+			manager.removeAccount(accountToRemove!);
+
+			expect(manager.getAccountCount()).toBe(2);
+			expect(manager.getActiveIndexForFamily("codex")).toBe(1);
+		});
+
+		it("decrements currentAccountIndex when removing first account", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 1,
+				accounts: [
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+
+			manager.setActiveIndex(0);
+			const firstAccount = manager.getCurrentAccount();
+			expect(firstAccount?.refreshToken).toBe("token-1");
+
+			manager.setActiveIndex(1);
+			manager.removeAccount(firstAccount!);
+
+			expect(manager.getAccountCount()).toBe(1);
+			expect(manager.getActiveIndexForFamily("codex")).toBe(0);
+		});
+
+		it("resets indices when removing last remaining account", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			manager.removeAccount(account);
+
+			expect(manager.getAccountCount()).toBe(0);
+			expect(manager.getActiveIndexForFamily("codex")).toBe(-1);
+		});
+	});
+		describe("active-account pointer dangle (audit HIGH-3)", () => {
+			it("advances active pointer to next enabled account when active is at last slot", () => {
+				const now = Date.now();
+				const stored = {
+					version: 3 as const,
+					activeIndex: 2,
+					activeIndexByFamily: { codex: 2 },
+					accounts: [
+						{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+						{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+						{ refreshToken: "token-3", addedAt: now, lastUsed: now },
+					],
+				};
+
+				const manager = new AccountManager(undefined, stored as never);
+				const active = manager.getCurrentAccountForFamily("codex");
+				expect(active?.refreshToken).toBe("token-3");
+
+				// Remove the currently active account that lives at the last slot.
+				manager.removeAccount(active!);
+
+				expect(manager.getAccountCount()).toBe(2);
+				// Pointer must reference a valid enabled account, not -1.
+				const after = manager.getActiveIndexForFamily("codex");
+				expect(after).toBeGreaterThanOrEqual(0);
+				expect(after).toBeLessThan(2);
+				const newActive = manager.getCurrentAccountForFamily("codex");
+				expect(newActive).not.toBeNull();
+				expect(newActive?.enabled).not.toBe(false);
+			});
+
+			it("advances active pointer to next enabled when active is at middle slot", () => {
+				const now = Date.now();
+				const stored = {
+					version: 3 as const,
+					activeIndex: 1,
+					activeIndexByFamily: { codex: 1 },
+					accounts: [
+						{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+						{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+						{ refreshToken: "token-3", addedAt: now, lastUsed: now },
+					],
+				};
+
+				const manager = new AccountManager(undefined, stored as never);
+				const active = manager.getCurrentAccountForFamily("codex");
+				expect(active?.refreshToken).toBe("token-2");
+
+				manager.removeAccount(active!);
+
+				expect(manager.getAccountCount()).toBe(2);
+				// After removing token-2 from index 1, token-3 slides into index 1.
+				// The pointer should now reference token-3 (the successor).
+				const newActive = manager.getCurrentAccountForFamily("codex");
+				expect(newActive?.refreshToken).toBe("token-3");
+				expect(manager.getActiveIndexForFamily("codex")).toBe(1);
+			});
+
+			it("yields no routable account when every remaining account is disabled", () => {
+				const now = Date.now();
+				const stored = {
+					version: 3 as const,
+					activeIndex: 2,
+					activeIndexByFamily: { codex: 2 },
+					accounts: [
+						{ refreshToken: "token-1", addedAt: now, lastUsed: now, enabled: false },
+						{ refreshToken: "token-2", addedAt: now, lastUsed: now, enabled: false },
+						{ refreshToken: "token-3", addedAt: now, lastUsed: now, enabled: true },
+					],
+				};
+
+				const manager = new AccountManager(undefined, stored as never);
+				const active = manager.getCurrentAccountForFamily("codex");
+				expect(active?.refreshToken).toBe("token-3");
+
+				// Remove the last enabled account; remaining pool is all-disabled.
+				manager.removeAccount(active!);
+
+				expect(manager.getAccountCount()).toBe(2);
+				// getCurrentAccountForFamily returns null whenever the pointer
+				// references a disabled slot or is -1, which is the observable
+				// contract callers rely on for "no routable account".
+				expect(manager.getCurrentAccountForFamily("codex")).toBeNull();
+			});
+
+			it("sets active pointer to -1 when pool becomes empty", () => {
+				const now = Date.now();
+				const stored = {
+					version: 3 as const,
+					activeIndex: 0,
+					accounts: [
+						{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+					],
+				};
+
+				const manager = new AccountManager(undefined, stored);
+				const account = manager.getCurrentAccount()!;
+				manager.removeAccount(account);
+
+				expect(manager.getAccountCount()).toBe(0);
+				expect(manager.getActiveIndexForFamily("codex")).toBe(-1);
+			});
+
+			it("does not perturb unrelated family pointers", () => {
+				const now = Date.now();
+				const stored = {
+					version: 3 as const,
+					activeIndex: 0,
+					activeIndexByFamily: { codex: 2 },
+					accounts: [
+						{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+						{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+						{ refreshToken: "token-3", addedAt: now, lastUsed: now },
+					],
+				};
+
+				const manager = new AccountManager(undefined, stored as never);
+				// Pick a family other than codex that exists in MODEL_FAMILIES.
+				const otherFamilies = MODEL_FAMILIES.filter((f) => f !== "codex");
+				if (otherFamilies.length === 0) {
+					// Defensive: single-family config means this test reduces to no-op.
+					return;
+				}
+				const otherFamily = otherFamilies[0]!;
+
+				// Drive the other-family pointer to index 0 via its own rotation.
+				// Directly manipulate via getActiveIndexForFamily/setActiveIndex since
+				// setActiveIndex mirrors all families; instead rotate the target
+				// family by calling getCurrentOrNextForFamily once.
+				const viaRotation = manager.getCurrentOrNextForFamily(otherFamily);
+				expect(viaRotation).not.toBeNull();
+				const otherBefore = manager.getActiveIndexForFamily(otherFamily);
+				expect(otherBefore).toBeGreaterThanOrEqual(0);
+				expect(otherBefore).toBeLessThan(3);
+
+				// Remove the codex-active account (last slot).
+				const codexActive = manager.getCurrentAccountForFamily("codex");
+				expect(codexActive?.refreshToken).toBe("token-3");
+				manager.removeAccount(codexActive!);
+
+				// The other family's pointer must still reference a valid enabled
+				// account in the new pool; it must not dangle to -1 just because we
+				// removed from codex.
+				const otherAfter = manager.getActiveIndexForFamily(otherFamily);
+				expect(otherAfter).toBeGreaterThanOrEqual(0);
+				expect(otherAfter).toBeLessThan(2);
+				const otherAccount = manager.getCurrentAccountForFamily(otherFamily);
+				expect(otherAccount).not.toBeNull();
+				expect(otherAccount?.enabled).not.toBe(false);
+			});
+
+			it("invalidates numeric runtime tracker key after removeAccount reindex (HI-01)", () => {
+				// Regression: _runtimeTrackerKey was cached to the numeric
+				// account.index when no accountId/email was present. After
+				// removeAccount spliced the array and reindexed surviving
+				// accounts, the cached numeric key still pointed at the
+				// old (stale) position, so getRuntimeTrackerKey returned the
+				// wrong key and rotation/health/token tracker lookups
+				// mismatched the current index. Identity-based string keys
+				// must continue to survive a reindex unchanged.
+				const now = Date.now();
+				const stored = {
+					version: 3 as const,
+					activeIndex: 0,
+					accounts: [
+						{ refreshToken: "token-a", addedAt: now, lastUsed: now },
+						{
+							refreshToken: "token-b",
+							email: "remove-me@example.com",
+							addedAt: now,
+							lastUsed: now,
+						},
+						{ refreshToken: "token-c", addedAt: now, lastUsed: now },
+				{
+					refreshToken: "token-d",
+					addedAt: now,
+					lastUsed: now,
+				},
+					],
+				};
+
+				const manager = new AccountManager(undefined, stored);
+
+				const refreshOnlyBefore = manager.getAccountByIndex(2)!;
+				const refreshOnlyAfterShift = manager.getAccountByIndex(3)!;
+
+				// Prime the cache: getRuntimeTrackerKey writes
+				// _runtimeTrackerKey on first access. The refresh-only
+				// account caches its numeric index (2); the identity
+				// account caches its string identity key.
+				const refreshKeyBefore = getRuntimeTrackerKey(refreshOnlyBefore);
+				const refreshOnlyAfterShiftKeyBefore = getRuntimeTrackerKey(
+					refreshOnlyAfterShift,
+				);
+				expect(refreshKeyBefore).toBe(2);
+				expect(refreshOnlyAfterShiftKeyBefore).toBe(3);
+				expect(refreshOnlyBefore._runtimeTrackerKey).toBe(2);
+				expect(refreshOnlyAfterShift._runtimeTrackerKey).toBe(3);
+
+				// Record observable tracker state keyed by the current
+				// tracker key so we can prove the same account is
+				// consulted under its new key after the reindex. Use the
+				// health tracker: that is what recordFailure mutates via
+				// getRuntimeTrackerKey.
+				const healthTracker = getHealthTracker();
+				const tokenTracker = getTokenTracker();
+				const initialRefreshScore = healthTracker.getScore(
+					refreshKeyBefore,
+					"codex",
+				);
+				manager.recordFailure(refreshOnlyBefore, "codex");
+				tokenTracker.tryConsume(refreshKeyBefore, "codex");
+				const postFailureScore = healthTracker.getScore(
+					refreshKeyBefore,
+					"codex",
+				);
+				expect(postFailureScore).toBeLessThan(initialRefreshScore);
+				expect(tokenTracker.getTokens(refreshKeyBefore, "codex")).toBeLessThan(
+					50,
+				);
+
+				// Remove the identity-bearing account at index 1. The
+				// refresh-only account that was at index 2 now lives at
+				// index 1 after the splice + reindex.
+				const victim = manager.getAccountByIndex(1)!;
+				expect(manager.removeAccount(victim)).toBe(true);
+
+				const refreshOnlyAfter = manager.getAccountByIndex(1);
+				expect(refreshOnlyAfter).not.toBeNull();
+				expect(refreshOnlyAfter?.refreshToken).toBe("token-c");
+				expect(refreshOnlyAfter?.index).toBe(1);
+
+				// getRuntimeTrackerKey must now report the NEW numeric
+				// index (1), not the stale cached value (2). Before the
+				// fix, the stale cache caused this assertion to fail with 2.
+				const refreshKeyAfter = getRuntimeTrackerKey(refreshOnlyAfter!);
+				expect(refreshKeyAfter).toBe(1);
+				expect(refreshOnlyAfter?._runtimeTrackerKey).toBe(1);
+
+				// The health score recorded under the pre-reindex key (2)
+				// must NOT bleed into the post-reindex key (1). Querying
+				// the new key should return the default (pristine) score.
+				// This proves the runtime tracker consults the refreshed
+				// key after reindex.
+				expect(healthTracker.getScore(refreshKeyAfter, "codex")).toBe(
+					initialRefreshScore,
+				);
+
+				// The next refresh-only survivor shifts from numeric key 3 to 2.
+				// The stale numeric state for old key 2 must NOT bleed onto it.
+				const refreshOnlyShifted = manager.getAccountByIndex(2);
+				expect(refreshOnlyShifted).not.toBeNull();
+				expect(refreshOnlyShifted?.refreshToken).toBe("token-d");
+				expect(refreshOnlyShifted?.index).toBe(2);
+				const refreshOnlyShiftedKeyAfter = getRuntimeTrackerKey(
+					refreshOnlyShifted!,
+				);
+				expect(refreshOnlyShiftedKeyAfter).toBe(2);
+				expect(healthTracker.getScore(refreshOnlyShiftedKeyAfter, "codex")).toBe(
+					initialRefreshScore,
+				);
+				expect(tokenTracker.getTokens(refreshOnlyShiftedKeyAfter, "codex")).toBe(
+					50,
+				);
+			});
+		});
+
+		describe("removed-current retarget signal (HI-04)", () => {
+			// PR #413 hardened removeAccount() to avoid the pointer-dangle
+			// default-to-minus-one behavior, but it silently retargeted the
+			// current pointer onto a different account when the removed
+			// account WAS the current one. HI-04 flagged that silent
+			// retarget: callers observing getCurrentAccountForFamily()
+			// receive an account they never selected with no audit trail.
+			//
+			// The fix stamps lastSwitchReason="rotation" on the successor
+			// whenever removeAccount() retargets off the removed slot. This
+			// mirrors the convention already used by setActiveIndex() and
+			// markSwitched() for pool-driven selection events.
+
+			it("stamps lastSwitchReason='rotation' on successor when current is removed", () => {
+				const now = Date.now();
+				const stored = {
+					version: 3 as const,
+					activeIndex: 1,
+					activeIndexByFamily: { codex: 1 },
+					accounts: [
+						{ refreshToken: "token-1", addedAt: now, lastUsed: now, lastSwitchReason: "initial" as const },
+						{ refreshToken: "token-2", addedAt: now, lastUsed: now, lastSwitchReason: "initial" as const },
+						{ refreshToken: "token-3", addedAt: now, lastUsed: now, lastSwitchReason: "initial" as const },
+					],
+				};
+
+				const manager = new AccountManager(undefined, stored as never);
+				const active = manager.getCurrentAccountForFamily("codex");
+				expect(active?.refreshToken).toBe("token-2");
+
+				// Remove the currently active (middle) account. The successor
+				// (token-3) shifts into index 1 and becomes the new current.
+				manager.removeAccount(active!);
+
+				const after = manager.getCurrentAccountForFamily("codex");
+				expect(after?.refreshToken).toBe("token-3");
+				// Successor must be explicitly stamped with the rotation
+				// reason so callers can tell the pool retargeted them rather
+				// than assuming they still hold the account they originally
+				// selected.
+				expect(after?.lastSwitchReason).toBe("rotation");
+
+				// The untouched account (token-1) retains its prior reason,
+				// proving we only stamp the successor the retarget landed on.
+				const untouched = manager.getAccountByIndex(0);
+				expect(untouched?.refreshToken).toBe("token-1");
+				expect(untouched?.lastSwitchReason).toBe("initial");
+			});
+
+			it("does not stamp a successor when every remaining account is disabled", () => {
+				const now = Date.now();
+				const stored = {
+					version: 3 as const,
+					activeIndex: 2,
+					activeIndexByFamily: { codex: 2 },
+					accounts: [
+						{ refreshToken: "token-1", addedAt: now, lastUsed: now, enabled: false, lastSwitchReason: "initial" as const },
+						{ refreshToken: "token-2", addedAt: now, lastUsed: now, enabled: false, lastSwitchReason: "initial" as const },
+						{ refreshToken: "token-3", addedAt: now, lastUsed: now, enabled: true, lastSwitchReason: "initial" as const },
+					],
+				};
+
+				const manager = new AccountManager(undefined, stored as never);
+				const active = manager.getCurrentAccountForFamily("codex");
+				expect(active?.refreshToken).toBe("token-3");
+
+				// Remove the last enabled account; remaining pool is entirely
+				// disabled. Pointer must fall to -1 (no routable account).
+				manager.removeAccount(active!);
+
+				expect(manager.getCurrentAccountForFamily("codex")).toBeNull();
+				expect(manager.getActiveIndexForFamily("codex")).toBe(-1);
+
+				// Neither surviving (disabled) account may be silently
+				// promoted by having rotation stamped on them. Their stored
+				// reason must stay "initial".
+				for (let i = 0; i < manager.getAccountCount(); i++) {
+					const acc = manager.getAccountByIndex(i);
+					expect(acc?.lastSwitchReason).toBe("initial");
+				}
+			});
+
+			it("stamps the sole enabled successor when all other peers are disabled", () => {
+				const now = Date.now();
+				const stored = {
+					version: 3 as const,
+					activeIndex: 0,
+					activeIndexByFamily: { codex: 0 },
+					accounts: [
+						{ refreshToken: "token-1", addedAt: now, lastUsed: now, enabled: true, lastSwitchReason: "initial" as const },
+						{ refreshToken: "token-2", addedAt: now, lastUsed: now, enabled: false, lastSwitchReason: "initial" as const },
+						{ refreshToken: "token-3", addedAt: now, lastUsed: now, enabled: true, lastSwitchReason: "initial" as const },
+					],
+				};
+
+				const manager = new AccountManager(undefined, stored as never);
+				const active = manager.getCurrentAccountForFamily("codex");
+				expect(active?.refreshToken).toBe("token-1");
+
+				// Remove the currently active account (token-1). token-2 is
+				// disabled, so findNextEnabled must skip it and land on
+				// token-3 (the single remaining enabled peer).
+				manager.removeAccount(active!);
+
+				const after = manager.getCurrentAccountForFamily("codex");
+				expect(after?.refreshToken).toBe("token-3");
+				expect(after?.lastSwitchReason).toBe("rotation");
+
+				// The disabled peer that was skipped during retarget must
+				// keep its original reason â€” we only stamp the account the
+				// pointer actually lands on.
+				const disabledPeer = manager.getAccountByIndex(0);
+				expect(disabledPeer?.refreshToken).toBe("token-2");
+				expect(disabledPeer?.lastSwitchReason).toBe("initial");
+			});
+		});
+	describe("flushPendingSave", () => {
+		it("flushes pending debounced save", async () => {
+			const { saveAccounts } = await import("../lib/storage.js");
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			mockSaveAccounts.mockResolvedValue();
+
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+
+			manager.saveToDiskDebounced(10000);
+			await manager.flushPendingSave();
+
+			expect(mockSaveAccounts).toHaveBeenCalled();
+		});
+
+		it("does nothing when no pending save", async () => {
+			const { saveAccounts } = await import("../lib/storage.js");
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			mockSaveAccounts.mockClear();
+
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			await manager.flushPendingSave();
+
+			expect(mockSaveAccounts).not.toHaveBeenCalled();
+		});
+
+		it("waits for pendingSave if it exists during flush", async () => {
+			const { saveAccounts } = await import("../lib/storage.js");
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			mockSaveAccounts.mockClear();
+
+			let resolveFirst: () => void;
+			const firstSave = new Promise<void>((resolve) => {
+				resolveFirst = resolve;
+			});
+			mockSaveAccounts.mockImplementationOnce(() => firstSave);
+			mockSaveAccounts.mockResolvedValue();
+
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+
+			const savePromise = manager.saveToDisk();
+			const flushPromise = manager.flushPendingSave();
+
+			resolveFirst!();
+			await savePromise;
+			await flushPromise;
+
+			expect(mockSaveAccounts).toHaveBeenCalled();
+		});
+
+		it("waits for in-flight pendingSave without timer", async () => {
+			const { saveAccounts } = await import("../lib/storage.js");
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			mockSaveAccounts.mockClear();
+
+			let resolveInFlight: () => void;
+			const inFlightSave = new Promise<void>((resolve) => {
+				resolveInFlight = resolve;
+			});
+			mockSaveAccounts.mockImplementation(() => inFlightSave);
+
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+
+			const savePromise = manager.saveToDisk();
+
+			queueMicrotask(() => resolveInFlight!());
+
+			await manager.flushPendingSave();
+			await savePromise;
+		});
+	});
+
+	describe("health and token tracking methods", () => {
+		beforeEach(() => {
+			resetTrackers();
+			clearCircuitBreakers();
+		});
+
+		afterEach(() => {
+			resetTrackers();
+			clearCircuitBreakers();
+		});
+
+		it("recordSuccess updates health tracker with model-specific quotaKey", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			const healthTracker = getHealthTracker();
+			const trackerKey = getRuntimeAccountIdentityKey(account)!;
+
+			manager.recordSuccess(account, "codex", "gpt-5.1");
+
+			const score = healthTracker.getScore(trackerKey, "codex:gpt-5.1");
+			expect(score).toBe(100);
+		});
+
+		it("recordSuccess updates health tracker with family-only quotaKey when model is null", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			const healthTracker = getHealthTracker();
+			const trackerKey = getRuntimeAccountIdentityKey(account)!;
+
+			manager.recordSuccess(account, "codex", null);
+
+			const score = healthTracker.getScore(trackerKey, "codex");
+			expect(score).toBe(100);
+		});
+
+		it("recordSuccess closes the circuit breaker after a half-open retry succeeds", () => {
+			vi.useFakeTimers();
+			vi.setSystemTime(new Date(0));
+
+			try {
+				const now = Date.now();
+				const stored = {
+					version: 3 as const,
+					activeIndex: 0,
+					accounts: [
+						{
+							refreshToken: "token-1",
+							email: "breaker@example.com",
+							addedAt: now,
+							lastUsed: now,
+						},
+					],
+				};
+
+				const manager = new AccountManager(undefined, stored);
+				const account = manager.getCurrentAccount()!;
+				const breaker = getCircuitBreaker(getAccountIdentityKey(account)!);
+
+				manager.recordFailure(account, "codex");
+				manager.recordFailure(account, "codex");
+				manager.recordFailure(account, "codex");
+				expect(breaker.getState()).toBe("open");
+
+				vi.advanceTimersByTime(
+					DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs + 1,
+				);
+				expect(manager.consumeToken(account, "codex")).toBe(true);
+				manager.recordSuccess(account, "codex");
+				expect(breaker.getState()).toBe("closed");
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("recordSuccess clears stale auth failure state and persists the healed account", async () => {
+			const { saveAccounts } = await import("../lib/storage.js");
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			mockSaveAccounts.mockClear();
+
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "token-1",
+						addedAt: now,
+						lastUsed: now,
+						consecutiveAuthFailures: 2,
+						coolingDownUntil: now - 1000,
+						cooldownReason: "network-error" as const,
+					},
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			account.consecutiveAuthFailures = 2;
+
+			manager.recordSuccess(account, "codex", "gpt-5.1");
+			await manager.flushPendingSave();
+
+			expect(account.consecutiveAuthFailures).toBe(0);
+			expect(account.coolingDownUntil).toBeUndefined();
+			expect(account.cooldownReason).toBeUndefined();
+			expect(mockSaveAccounts).toHaveBeenCalledTimes(1);
+			const persisted = mockSaveAccounts.mock.calls[0]?.[0];
+			expect(persisted?.accounts[0]?.consecutiveAuthFailures ?? 0).toBe(0);
+			expect(persisted?.accounts[0]?.coolingDownUntil).toBeUndefined();
+			expect(persisted?.accounts[0]?.cooldownReason).toBeUndefined();
+		});
+
+		it("recordSuccess clears stale cooldown metadata when only the reason remains", async () => {
+			const { saveAccounts } = await import("../lib/storage.js");
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			mockSaveAccounts.mockClear();
+
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "token-1",
+						addedAt: now,
+						lastUsed: now,
+						cooldownReason: "network-error" as const,
+					},
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+
+			manager.recordSuccess(account, "codex", "gpt-5.1");
+			await manager.flushPendingSave();
+
+			expect(account.coolingDownUntil).toBeUndefined();
+			expect(account.cooldownReason).toBeUndefined();
+			expect(mockSaveAccounts).toHaveBeenCalledTimes(1);
+			const persisted = mockSaveAccounts.mock.calls[0]?.[0];
+			expect(persisted?.accounts[0]?.coolingDownUntil).toBeUndefined();
+			expect(persisted?.accounts[0]?.cooldownReason).toBeUndefined();
+		});
+
+		it("recordSuccess does not clear an active cooldown from a newer concurrent failure", async () => {
+			const { saveAccounts } = await import("../lib/storage.js");
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			mockSaveAccounts.mockClear();
+
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "token-1",
+						addedAt: now,
+						lastUsed: now,
+						consecutiveAuthFailures: 2,
+						coolingDownUntil: now + 60_000,
+						cooldownReason: "auth-failure" as const,
+					},
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			account.consecutiveAuthFailures = 2;
+
+			manager.recordSuccess(account, "codex", "gpt-5.1");
+			await manager.flushPendingSave();
+
+			expect(account.consecutiveAuthFailures).toBe(2);
+			expect(account.coolingDownUntil).toBe(now + 60_000);
+			expect(account.cooldownReason).toBe("auth-failure");
+			expect(mockSaveAccounts).not.toHaveBeenCalled();
+		});
+
+		it("recordRateLimit updates health and drains token bucket", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			const healthTracker = getHealthTracker();
+			const tokenTracker = getTokenTracker();
+			const trackerKey = getRuntimeAccountIdentityKey(account)!;
+
+			manager.recordRateLimit(account, "codex", "gpt-5.1");
+
+			const score = healthTracker.getScore(trackerKey, "codex:gpt-5.1");
+			const tokens = tokenTracker.getTokens(trackerKey, "codex:gpt-5.1");
+			expect(score).toBeLessThan(100);
+			expect(tokens).toBeLessThan(50);
+		});
+
+		it("recordRateLimit uses family-only quotaKey when model is undefined", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			const healthTracker = getHealthTracker();
+			const trackerKey = getRuntimeAccountIdentityKey(account)!;
+
+			manager.recordRateLimit(account, "gpt-5.2");
+
+			const score = healthTracker.getScore(trackerKey, "gpt-5.2");
+			expect(score).toBeLessThan(100);
+		});
+
+		it("scopes quota rate limits to the family bucket only", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+
+			manager.markRateLimitedWithReason(
+				account,
+				60_000,
+				"codex",
+				"quota",
+				"gpt-5.1",
+			);
+
+			expect(account.rateLimitResetTimes.codex).toBeTypeOf("number");
+			expect(account.rateLimitResetTimes["codex:gpt-5.1"]).toBeUndefined();
+		});
+
+		it("scopes token rate limits to the model bucket", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+
+			manager.markRateLimitedWithReason(
+				account,
+				60_000,
+				"codex",
+				"tokens",
+				"gpt-5.1",
+			);
+
+			expect(account.rateLimitResetTimes.codex).toBeUndefined();
+			expect(account.rateLimitResetTimes["codex:gpt-5.1"]).toBeTypeOf("number");
+		});
+
+		it("recordFailure updates health tracker", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			const healthTracker = getHealthTracker();
+			const trackerKey = getRuntimeAccountIdentityKey(account)!;
+
+			manager.recordFailure(account, "codex", "gpt-5.2");
+
+			const score = healthTracker.getScore(trackerKey, "codex:gpt-5.2");
+			expect(score).toBeLessThan(100);
+		});
+
+		it("recordFailure opens the circuit breaker after repeated failures", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "token-1",
+						email: "breaker@example.com",
+						addedAt: now,
+						lastUsed: now,
+					},
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			const breaker = getCircuitBreaker(getAccountIdentityKey(account)!);
+
+			manager.recordFailure(account, "codex");
+			manager.recordFailure(account, "codex");
+			manager.recordFailure(account, "codex");
+
+			expect(breaker.getState()).toBe("open");
+		});
+
+		it("recordFailure uses family-only quotaKey when model is null", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			const healthTracker = getHealthTracker();
+			const trackerKey = getRuntimeAccountIdentityKey(account)!;
+
+			manager.recordFailure(account, "gpt-5.1", null);
+
+			const score = healthTracker.getScore(trackerKey, "gpt-5.1");
+			expect(score).toBeLessThan(100);
+		});
+
+		it("consumeToken returns true and consumes from token bucket", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			const tokenTracker = getTokenTracker();
+			const trackerKey = getRuntimeAccountIdentityKey(account)!;
+
+			const initialTokens = tokenTracker.getTokens(trackerKey, "codex:gpt-5.1");
+			const result = manager.consumeToken(account, "codex", "gpt-5.1");
+			const afterTokens = tokenTracker.getTokens(trackerKey, "codex:gpt-5.1");
+
+			expect(result).toBe(true);
+			expect(afterTokens).toBeLessThan(initialTokens);
+		});
+
+		it("consumeToken uses family-only quotaKey when model is undefined", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+
+			const result = manager.consumeToken(account, "codex");
+
+			expect(result).toBe(true);
+		});
+
+		it("consumeToken returns false and refunds the token when the circuit is open", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "token-1",
+						email: "breaker@example.com",
+						addedAt: now,
+						lastUsed: now,
+					},
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			const account = manager.getCurrentAccount()!;
+			const tokenTracker = getTokenTracker();
+			const trackerKey = getRuntimeTrackerKey(account);
+			const initialTokens = tokenTracker.getTokens(trackerKey, "codex");
+
+			manager.recordFailure(account, "codex");
+			manager.recordFailure(account, "codex");
+			manager.recordFailure(account, "codex");
+
+			expect(manager.consumeToken(account, "codex")).toBe(false);
+			expect(tokenTracker.getTokens(trackerKey, "codex")).toBe(initialTokens);
+		});
+
+		it("consumeToken returns false and refunds when the half-open slot is exhausted", () => {
+			vi.useFakeTimers();
+			vi.setSystemTime(new Date(0));
+
+			try {
+				const now = Date.now();
+				const stored = {
+					version: 3 as const,
+					activeIndex: 0,
+					accounts: [
+						{
+							refreshToken: "token-1",
+							email: "breaker@example.com",
+							addedAt: now,
+							lastUsed: now,
+						},
+					],
+				};
+
+				const manager = new AccountManager(undefined, stored);
+				const account = manager.getCurrentAccount()!;
+				const tokenTracker = getTokenTracker();
+				const trackerKey = getRuntimeTrackerKey(account);
+				const initialTokens = tokenTracker.getTokens(trackerKey, "codex");
+
+				manager.recordFailure(account, "codex");
+				manager.recordFailure(account, "codex");
+				manager.recordFailure(account, "codex");
+
+				vi.advanceTimersByTime(
+					DEFAULT_CIRCUIT_BREAKER_CONFIG.resetTimeoutMs + 1,
+				);
+
+				expect(manager.consumeToken(account, "codex")).toBe(true);
+				expect(manager.consumeToken(account, "codex")).toBe(false);
+				expect(tokenTracker.getTokens(trackerKey, "codex")).toBe(
+					initialTokens - 1,
+				);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("keeps refresh-only tracker state stable when the refresh token rotates", () => {
+			vi.useFakeTimers();
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			try {
+				const now = Date.now();
+				const stored = {
+					version: 3 as const,
+					activeIndex: 0,
+					accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+				};
+
+				const manager = new AccountManager(undefined, stored);
+				const account = manager.getCurrentAccount()!;
+				const healthTracker = getHealthTracker();
+				const tokenTracker = getTokenTracker();
+				const trackerKey = getRuntimeTrackerKey(account);
+
+				manager.recordFailure(account, "codex", "gpt-5.1");
+				const degradedScore = healthTracker.getScore(
+					trackerKey,
+					"codex:gpt-5.1",
+				);
+				expect(manager.consumeToken(account, "codex", "gpt-5.1")).toBe(true);
+
+				account.refreshToken = "token-1-rotated";
+
+				const rotatedAccount = manager.getCurrentAccount()!;
+				expect(getRuntimeTrackerKey(rotatedAccount)).toBe(trackerKey);
+				expect(getRuntimeAccountIdentityKey(rotatedAccount)).toBe(trackerKey);
+				expect(getAccountIdentityKey(rotatedAccount)).not.toBe(`${trackerKey}`);
+				expect(healthTracker.getScore(trackerKey, "codex:gpt-5.1")).toBeCloseTo(
+					degradedScore,
+					6,
+				);
+				expect(
+					tokenTracker.getTokens(trackerKey, "codex:gpt-5.1"),
+				).toBeLessThan(50);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("keeps pinned runtime tracker state stable after updateFromAuth enriches identity", () => {
+			vi.useFakeTimers();
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			try {
+				const now = Date.now();
+				const stored = {
+					version: 3 as const,
+					activeIndex: 0,
+					accounts: [
+						{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+						{
+							refreshToken: "token-2",
+							email: "healthy@example.com",
+							addedAt: now,
+							lastUsed: now,
+						},
+					],
+				};
+
+				const manager = new AccountManager(undefined, stored);
+				const account = manager.getAccountByIndex(0)!;
+				const healthTracker = getHealthTracker();
+				const tokenTracker = getTokenTracker();
+				const trackerKey = getRuntimeTrackerKey(account);
+
+				manager.recordFailure(account, "codex", "gpt-5.1");
+				const degradedScore = healthTracker.getScore(
+					trackerKey,
+					"codex:gpt-5.1",
+				);
+				expect(manager.consumeToken(account, "codex", "gpt-5.1")).toBe(true);
+
+				const payload = Buffer.from(
+					JSON.stringify({
+						email: "enriched@example.com",
+						"https://api.openai.com/auth": {
+							chatgpt_account_id: "account-enriched",
+						},
+						exp: Math.floor((now + 3600000) / 1000),
+					}),
+				).toString("base64url");
+				const accessToken = `header.${payload}.signature`;
+
+				manager.updateFromAuth(account, {
+					type: "oauth",
+					access: accessToken,
+					refresh: "token-1-rotated",
+					expires: now + 3600000,
+				});
+
+				expect(account.accountId).toBe("account-enriched");
+				expect(account.email).toBe("enriched@example.com");
+				expect(getRuntimeAccountIdentityKey(account)).toBe(
+					"account:account-enriched::email:enriched@example.com",
+				);
+				expect(getRuntimeTrackerKey(account)).toBe(trackerKey);
+				expect(healthTracker.getScore(trackerKey, "codex:gpt-5.1")).toBeCloseTo(
+					degradedScore,
+					5,
+				);
+				expect(
+					tokenTracker.getTokens(trackerKey, "codex:gpt-5.1"),
+				).toBeLessThan(50);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("preserves tracker state when account indexes shift", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 1,
+				activeIndexByFamily: { codex: 1 },
+				accounts: [
+					{
+						refreshToken: "token-1",
+						email: "first@example.com",
+						addedAt: now,
+						lastUsed: now,
+					},
+					{
+						refreshToken: "token-2",
+						email: "second@example.com",
+						addedAt: now,
+						lastUsed: now,
+					},
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored as never);
+			const trackedAccount = manager.getAccountByIndex(1)!;
+			const trackerKey = getAccountIdentityKey(trackedAccount)!;
+			const healthTracker = getHealthTracker();
+			const tokenTracker = getTokenTracker();
+
+			manager.recordFailure(trackedAccount, "codex", "gpt-5.1");
+			expect(manager.consumeToken(trackedAccount, "codex", "gpt-5.1")).toBe(
+				true,
+			);
+
+			expect(manager.removeAccountByIndex(0)).toBe(true);
+
+			const remainingAccount = manager.getAccountByIndex(0)!;
+			expect(remainingAccount.email).toBe("second@example.com");
+			expect(remainingAccount.index).toBe(0);
+			expect(getAccountIdentityKey(remainingAccount)).toBe(trackerKey);
+			expect(healthTracker.getScore(trackerKey, "codex:gpt-5.1")).toBeLessThan(
+				100,
+			);
+			expect(tokenTracker.getTokens(trackerKey, "codex:gpt-5.1")).toBeLessThan(
+				50,
+			);
+		});
+	});
+
+	describe("hybrid selection fallback path", () => {
+		beforeEach(() => {
+			resetTrackers();
+			clearCircuitBreakers();
+		});
+
+		afterEach(() => {
+			resetTrackers();
+			clearCircuitBreakers();
+		});
+
+		it("selects alternate account when current is rate-limited via selectHybridAccount", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				activeIndexByFamily: { codex: 0 },
+				accounts: [
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-2", addedAt: now, lastUsed: now - 10000 },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored as never);
+
+			const account0 = manager.setActiveIndex(0)!;
+			manager.markRateLimited(account0, 60000, "codex");
+
+			const selected = manager.getCurrentOrNextForFamilyHybrid("codex");
+
+			expect(selected).not.toBeNull();
+			expect(selected?.refreshToken).toBe("token-2");
+			expect(selected?.index).toBe(1);
+		});
+
+		it("re-scores on the next call instead of sticking to the prior hybrid winner", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				activeIndexByFamily: { codex: 0 },
+				accounts: [
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-2", addedAt: now, lastUsed: now - 5000 },
+					{ refreshToken: "token-3", addedAt: now, lastUsed: now - 10000 },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored as never);
+
+			const account0 = manager.getAccountsSnapshot()[0]!;
+			manager.markRateLimited(account0, 60000, "codex");
+
+			const selected = manager.getCurrentOrNextForFamilyHybrid("codex");
+			expect(selected).not.toBeNull();
+
+			const secondCall = manager.getCurrentOrNextForFamilyHybrid("codex");
+			expect(secondCall?.index).toBe(1);
+			expect(secondCall?.index).not.toBe(selected?.index);
+		});
+
+		it("skips accounts whose circuit breaker is open", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				activeIndexByFamily: { codex: 0 },
+				accounts: [
+					{
+						refreshToken: "token-1",
+						email: "first@example.com",
+						addedAt: now,
+						lastUsed: now,
+					},
+					{
+						refreshToken: "token-2",
+						email: "second@example.com",
+						addedAt: now,
+						lastUsed: now - 10_000,
+					},
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored as never);
+			const blocked = manager.getAccountByIndex(0)!;
+
+			manager.recordFailure(blocked, "codex");
+			manager.recordFailure(blocked, "codex");
+			manager.recordFailure(blocked, "codex");
+
+			const selected = manager.getCurrentOrNextForFamilyHybrid("codex");
+
+			expect(selected?.refreshToken).toBe("token-2");
+			expect(selected?.index).toBe(1);
+			expect(manager.isAccountAvailableForFamily(0, "codex")).toBe(false);
+		});
+
+		it("returns null when all accounts are rate-limited (AUDIT-H2 contract)", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				activeIndexByFamily: { codex: 0 },
+				accounts: [{ refreshToken: "token-1", addedAt: now, lastUsed: now }],
+			};
+
+			const manager = new AccountManager(undefined, stored as never);
+
+			const account0 = manager.setActiveIndex(0)!;
+			manager.markRateLimited(account0, 60000, "codex");
+
+			// Contract change (AUDIT-H2 / D-01): hybrid selector returns null when no
+			// account is currently available instead of returning the blocked LRU
+			// account via a "fallback". The caller is responsible for surfacing the
+			// pool-wide unavailable condition.
+			const selected = manager.getCurrentOrNextForFamilyHybrid("codex");
+			expect(selected).toBeNull();
+		});
+
+		it("normalizes active pointer to next enabled slot when active account is disabled (AUDIT-H10)", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 1,
+				activeIndexByFamily: { codex: 1 },
+				accounts: [
+					{ refreshToken: "token-0", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored as never);
+
+			// Sanity: active pointer initially references account 1.
+			expect(manager.getActiveIndexForFamily("codex")).toBe(1);
+
+			// Disable the active account.
+			manager.setAccountEnabled(1, false);
+
+			// AUDIT-H10 / D-05: active pointer must advance to the next enabled slot
+			// (index 2 here) so UI / automation / routing do not hold a stale pointer
+			// to a disabled account.
+			expect(manager.getActiveIndexForFamily("codex")).toBe(2);
+		});
+
+		it("returns -1 when all accounts are disabled (oracle F1)", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				activeIndexByFamily: { codex: 0 },
+				accounts: [
+					{ refreshToken: "token-0", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored as never);
+
+			// Disable every account in the pool.
+			manager.setAccountEnabled(0, false);
+			manager.setAccountEnabled(1, false);
+
+			// Oracle F1: all-disabled must surface as -1 (the empty-pool sentinel)
+			// so callers cannot trust a returned index without an enabled re-check.
+			expect(manager.getActiveIndexForFamily("codex")).toBe(-1);
+		});
+
+		it("preserves pointer semantics when the same account is disabled then re-enabled", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 1,
+				activeIndexByFamily: { codex: 1 },
+				accounts: [
+					{ refreshToken: "token-0", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored as never);
+
+			// Baseline: active pointer is on index 1.
+			expect(manager.getActiveIndexForFamily("codex")).toBe(1);
+
+			// Disable the active account: pointer walks forward to index 2.
+			manager.setAccountEnabled(1, false);
+			expect(manager.getActiveIndexForFamily("codex")).toBe(2);
+
+			// Re-enable index 1: the pointer already advanced to 2, and re-enabling
+			// must not silently rewind it back to 1 (the post-disable pointer is
+			// the authoritative state the rotation/UI have been observing).
+			manager.setAccountEnabled(1, true);
+			expect(manager.getActiveIndexForFamily("codex")).toBe(2);
+
+			// And index 1 is once again routable for explicit selection.
+			expect(manager.getAccountByIndex(1)?.enabled).not.toBe(false);
+		});
+
+		it("does not disturb sibling families' pointers when a disabled index only matches one family (oracle F2 multi-family)", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				activeIndexByFamily: {
+					codex: 0,
+					"gpt-5-codex": 2,
+				},
+				accounts: [
+					{ refreshToken: "token-0", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored as never);
+
+			// Baseline: each family points at its own slot.
+			expect(manager.getActiveIndexForFamily("codex")).toBe(0);
+			expect(manager.getActiveIndexForFamily("gpt-5-codex")).toBe(2);
+
+			// Disable account 0: only the codex family's pointer matches, so it
+			// must advance, but the gpt-5-codex pointer (index 2) must stay put.
+			manager.setAccountEnabled(0, false);
+
+			expect(manager.getActiveIndexForFamily("codex")).toBe(1);
+			expect(manager.getActiveIndexForFamily("gpt-5-codex")).toBe(2);
+		});
+	});
+
+	describe("getCurrentOrNextForFamilySequential (issue #509 drain-first)", () => {
+		// The circuit-open case below trips a breaker via recordFailure; the global
+		// beforeEach resets trackers but NOT circuit breakers, so clear them here to
+		// keep each sequential case isolated (otherwise an open breaker leaks into
+		// later cases and the selector skips a still-healthy account).
+		beforeEach(() => {
+			clearCircuitBreakers();
+		});
+
+		const makeStored = (count: number) => {
+			const now = Date.now();
+			return {
+				version: 3 as const,
+				activeIndex: 0,
+				activeIndexByFamily: { codex: 0 },
+				accounts: Array.from({ length: count }, (_, i) => ({
+					refreshToken: `token-${i}`,
+					addedAt: now,
+					lastUsed: now - i * 1000,
+				})),
+			};
+		};
+
+		it("sticks to the active account across calls while it stays available", () => {
+			const manager = new AccountManager(undefined, makeStored(2) as never);
+			manager.setActiveIndex(0);
+
+			const first = manager.getCurrentOrNextForFamilySequential("codex");
+			const second = manager.getCurrentOrNextForFamilySequential("codex");
+			const third = manager.getCurrentOrNextForFamilySequential("codex");
+
+			expect(first?.index).toBe(0);
+			expect(second?.index).toBe(0);
+			expect(third?.index).toBe(0);
+			// Cursor does NOT advance while draining the active account.
+			expect(manager.getActiveIndexForFamily("codex")).toBe(0);
+		});
+
+		it("advances to the next account only once the active one is exhausted", () => {
+			const manager = new AccountManager(undefined, makeStored(2) as never);
+			const account0 = manager.setActiveIndex(0)!;
+
+			expect(manager.getCurrentOrNextForFamilySequential("codex")?.index).toBe(0);
+
+			// Drain account 0 to 100% (rate-limited): selector must move to account 1.
+			manager.markRateLimited(account0, 60_000, "codex");
+
+			const afterDrain = manager.getCurrentOrNextForFamilySequential("codex");
+			expect(afterDrain?.index).toBe(1);
+			expect(afterDrain?.refreshToken).toBe("token-1");
+			expect(manager.getActiveIndexForFamily("codex")).toBe(1);
+
+			// And it now sticks to account 1.
+			expect(manager.getCurrentOrNextForFamilySequential("codex")?.index).toBe(1);
+		});
+
+		it("wraps back to a recovered earlier account when the current one drains", () => {
+			const manager = new AccountManager(undefined, makeStored(2) as never);
+			const account0 = manager.setActiveIndex(0)!;
+
+			// A drains -> switch to B.
+			manager.markRateLimited(account0, 60_000, "codex");
+			expect(manager.getCurrentOrNextForFamilySequential("codex")?.index).toBe(1);
+
+			// A's quota window recovers; B then drains.
+			account0.rateLimitResetTimes = {};
+			const account1 = manager.getAccountByIndex(1)!;
+			manager.markRateLimited(account1, 60_000, "codex");
+
+			// Sequential wraps forward from B (index 1) and reclaims recovered A.
+			const reclaimed = manager.getCurrentOrNextForFamilySequential("codex");
+			expect(reclaimed?.index).toBe(0);
+			expect(manager.getActiveIndexForFamily("codex")).toBe(0);
+		});
+
+		it("returns null when every account is exhausted", () => {
+			const manager = new AccountManager(undefined, makeStored(2) as never);
+			const account0 = manager.setActiveIndex(0)!;
+			const account1 = manager.getAccountByIndex(1)!;
+			manager.markRateLimited(account0, 60_000, "codex");
+			manager.markRateLimited(account1, 60_000, "codex");
+
+			expect(manager.getCurrentOrNextForFamilySequential("codex")).toBeNull();
+		});
+
+		it("advances when the active account is cooling down, then reclaims it on recovery", () => {
+			const manager = new AccountManager(undefined, makeStored(2) as never);
+			const account0 = manager.setActiveIndex(0)!;
+
+			// Cooldown is a non-rate-limit exhaustion path: selector must advance.
+			manager.markAccountCoolingDown(account0, 30_000, "auth-failure");
+			expect(manager.isAccountCoolingDown(account0)).toBe(true);
+
+			const afterCooldown = manager.getCurrentOrNextForFamilySequential("codex");
+			expect(afterCooldown?.index).toBe(1);
+			expect(manager.getActiveIndexForFamily("codex")).toBe(1);
+
+			// Account 0 recovers; account 1 then cools down -> wrap back to 0.
+			manager.clearAccountCooldown(account0);
+			const account1 = manager.getAccountByIndex(1)!;
+			manager.markAccountCoolingDown(account1, 30_000, "network-error");
+
+			const reclaimed = manager.getCurrentOrNextForFamilySequential("codex");
+			expect(reclaimed?.index).toBe(0);
+		});
+
+		it("advances when the active account's circuit is open", () => {
+			const manager = new AccountManager(undefined, makeStored(2) as never);
+			const account0 = manager.setActiveIndex(0)!;
+
+			// Trip the circuit breaker on the active account (3 consecutive failures).
+			manager.recordFailure(account0, "codex");
+			manager.recordFailure(account0, "codex");
+			manager.recordFailure(account0, "codex");
+
+			const selected = manager.getCurrentOrNextForFamilySequential("codex");
+			expect(selected?.index).toBe(1);
+			expect(manager.getActiveIndexForFamily("codex")).toBe(1);
+		});
+
+		it("drains a 3-account pool in order and wraps to a recovered account", () => {
+			const manager = new AccountManager(undefined, makeStored(3) as never);
+			const account0 = manager.setActiveIndex(0)!;
+
+			// A is primary.
+			expect(manager.getCurrentOrNextForFamilySequential("codex")?.index).toBe(0);
+
+			// A drains -> B.
+			manager.markRateLimited(account0, 60_000, "codex");
+			expect(manager.getCurrentOrNextForFamilySequential("codex")?.index).toBe(1);
+
+			// B drains -> C (forward scan past A which is still down).
+			const account1 = manager.getAccountByIndex(1)!;
+			manager.markRateLimited(account1, 60_000, "codex");
+			expect(manager.getCurrentOrNextForFamilySequential("codex")?.index).toBe(2);
+			expect(manager.getActiveIndexForFamily("codex")).toBe(2);
+
+			// A recovers; C drains -> wrap forward from C (index 2) past 0... A is the
+			// next usable, so it reclaims. Proves the scan wraps in a 3+ pool rather
+			// than just toggling between two accounts.
+			account0.rateLimitResetTimes = {};
+			const account2 = manager.getAccountByIndex(2)!;
+			manager.markRateLimited(account2, 60_000, "codex");
+			expect(manager.getCurrentOrNextForFamilySequential("codex")?.index).toBe(0);
+		});
+
+		it("skips a disabled active account and advances", () => {
+			const manager = new AccountManager(undefined, makeStored(2) as never);
+			manager.setActiveIndex(0);
+
+			// Disable the active account: isUsable must reject it and advance.
+			manager.setAccountEnabled(0, false);
+
+			const selected = manager.getCurrentOrNextForFamilySequential("codex");
+			expect(selected?.index).toBe(1);
+		});
+
+		it("selects the first usable account when activeIndex is unset (-1)", () => {
+			const stored = {
+				version: 3 as const,
+				activeIndex: -1,
+				activeIndexByFamily: { codex: -1 },
+				accounts: [
+					{ refreshToken: "token-0", addedAt: Date.now(), lastUsed: Date.now() },
+					{ refreshToken: "token-1", addedAt: Date.now(), lastUsed: Date.now() },
+				],
+			};
+			const manager = new AccountManager(undefined, stored as never);
+
+			// With no active account set, the forward scan starts at index 0.
+			const selected = manager.getCurrentOrNextForFamilySequential("codex");
+			expect(selected?.index).toBe(0);
+			expect(manager.getActiveIndexForFamily("codex")).toBe(0);
+		});
+
+		it("advances each ModelFamily independently (per-family cursor)", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				activeIndexByFamily: { codex: 0, "gpt-5.1": 0 },
+				accounts: [
+					{ refreshToken: "token-0", addedAt: now, lastUsed: now },
+					{ refreshToken: "token-1", addedAt: now, lastUsed: now - 1000 },
+				],
+			};
+			const manager = new AccountManager(undefined, stored as never);
+			const account0 = manager.getAccountByIndex(0)!;
+
+			// Exhaust account 0 for the codex family ONLY.
+			manager.markRateLimited(account0, 60_000, "codex");
+
+			// codex must advance to account 1...
+			expect(manager.getCurrentOrNextForFamilySequential("codex")?.index).toBe(1);
+			expect(manager.getActiveIndexForFamily("codex")).toBe(1);
+
+			// ...but gpt-5.1 is unaffected and still drains account 0.
+			expect(
+				manager.getCurrentOrNextForFamilySequential("gpt-5.1")?.index,
+			).toBe(0);
+			expect(manager.getActiveIndexForFamily("gpt-5.1")).toBe(0);
+		});
+
+		it("never anchors the active pointer on a policy-blocked account (#509 review P1)", () => {
+			const manager = new AccountManager(undefined, makeStored(2) as never);
+			const account0 = manager.setActiveIndex(0)!;
+			// Account 0 is exhausted; account 1 is otherwise usable but policy-blocked
+			// (e.g. paused/drained) for this request.
+			manager.markRateLimited(account0, 60_000, "codex");
+			const blocked = new Set([1]);
+
+			// Selector must NOT commit the active pointer to the blocked account.
+			const selected = manager.getCurrentOrNextForFamilySequential(
+				"codex",
+				null,
+				blocked,
+			);
+			expect(selected).toBeNull();
+			expect(manager.getActiveIndexForFamily("codex")).toBe(0);
+
+			// Once the block clears, account 1 becomes selectable normally.
+			const afterUnblock = manager.getCurrentOrNextForFamilySequential(
+				"codex",
+				null,
+				new Set(),
+			);
+			expect(afterUnblock?.index).toBe(1);
+		});
+	});
+});

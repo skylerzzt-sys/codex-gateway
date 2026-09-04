@@ -1,0 +1,595 @@
+import type { DashboardDisplaySettings } from "../../dashboard-settings.js";
+import { extractAccountEmail, sanitizeEmail } from "../../accounts.js";
+import {
+	buildForecastExplanation,
+	type ForecastAccountResult,
+	type RuntimeForecastOverlay,
+} from "../../forecast.js";
+import {
+	applyRefreshedAccountPatch,
+	persistRefreshedAccountPatch,
+	serializeForecastResults,
+	type AccountIdentityMatch,
+	type RefreshedAccountPatch,
+} from "../forecast-report-shared.js";
+import type { QuotaCacheData } from "../../quota-cache.js";
+import { type CodexQuotaSnapshot, describeCodexProbeFailure } from "../../quota-probe.js";
+import {
+	DEFAULT_PROBE_MODEL,
+	getModelProfile,
+	type ModelFamily,
+	resolveNormalizedModel,
+} from "../../request/helpers/model-map.js";
+import { type AccountMetadataV3, type AccountStorageV3 } from "../../storage.js";
+import type { TokenFailure, TokenResult } from "../../types.js";
+
+interface ForecastCliOptions {
+	live: boolean;
+	json: boolean;
+	explain: boolean;
+	model: string;
+	/**
+	 * Whether --model was actually passed. The default probe model is not a
+	 * codex-family model, so its family must NOT govern a bare invocation.
+	 */
+	modelProvided: boolean;
+	runtimeOverlay: boolean;
+}
+
+type ParsedArgsResult<T> =
+	| { ok: true; options: T }
+	| { ok: false; message: string };
+
+type PromptTone = "accent" | "success" | "warning" | "danger" | "muted";
+type QuotaEmailFallbackState = ReadonlyMap<
+	string,
+	{ matchingCount: number; distinctAccountIds: Set<string> }
+>;
+
+export interface ForecastCommandDeps {
+	setStoragePath: (path: string | null) => void;
+	loadAccounts: () => Promise<AccountStorageV3 | null>;
+	saveAccounts: (storage: AccountStorageV3) => Promise<void>;
+	loadDashboardDisplaySettings?: () => Promise<DashboardDisplaySettings>;
+	resolveActiveIndex: (storage: AccountStorageV3, family?: "codex") => number;
+	loadQuotaCache: () => Promise<QuotaCacheData | null>;
+	saveQuotaCache: (cache: QuotaCacheData) => Promise<void>;
+	cloneQuotaCacheData: (cache: QuotaCacheData) => QuotaCacheData;
+	buildQuotaEmailFallbackState: (
+		accounts: readonly Pick<AccountMetadataV3, "accountId" | "email">[],
+	) => QuotaEmailFallbackState;
+	updateQuotaCacheForAccount: (
+		cache: QuotaCacheData,
+		account: Pick<AccountMetadataV3, "accountId" | "email">,
+		snapshot: CodexQuotaSnapshot,
+		accounts: readonly Pick<AccountMetadataV3, "accountId" | "email">[],
+		emailFallbackState?: QuotaEmailFallbackState,
+	) => boolean;
+	hasUsableAccessToken: (
+		account: Pick<AccountMetadataV3, "accessToken" | "expiresAt">,
+		now: number,
+	) => boolean;
+	queuedRefresh: (refreshToken: string) => Promise<TokenResult>;
+	fetchCodexQuotaSnapshot: (input: {
+		accountId: string;
+		accessToken: string;
+		model: string;
+	}) => Promise<CodexQuotaSnapshot>;
+	normalizeFailureDetail: (
+		message: string | undefined,
+		reason: string | undefined,
+	) => string;
+	formatAccountLabel: (
+		account: Pick<AccountMetadataV3, "email" | "accountLabel" | "accountId">,
+		index: number,
+	) => string;
+	extractAccountId: (accessToken: string | undefined) => string | undefined;
+	evaluateForecastAccounts: (
+		inputs: Array<{
+			index: number;
+			account: AccountMetadataV3;
+			isCurrent: boolean;
+			now: number;
+			refreshFailure?: TokenFailure;
+			liveQuota?: CodexQuotaSnapshot;
+			quotaCache?: QuotaCacheData | null;
+			allAccounts?: readonly AccountMetadataV3[];
+			runtimeOverlay?: RuntimeForecastOverlay | null;
+			family?: ModelFamily;
+			model?: string | null;
+		}>,
+	) => ForecastAccountResult[];
+	summarizeForecast: (results: ForecastAccountResult[]) => {
+		total: number;
+		ready: number;
+		delayed: number;
+		unavailable: number;
+		highRisk: number;
+	};
+	recommendForecastAccount: (results: ForecastAccountResult[]) => {
+		recommendedIndex: number | null;
+		reason: string;
+	};
+	stylePromptText: (text: string, tone: PromptTone) => string;
+	formatResultSummary: (
+		segments: ReadonlyArray<{ text: string; tone: PromptTone }>,
+	) => string;
+	styleQuotaSummary: (summary: string) => string;
+	formatCompactQuotaSnapshot: (snapshot: CodexQuotaSnapshot) => string;
+	availabilityTone: (
+		availability: ForecastAccountResult["availability"],
+	) => "success" | "warning" | "danger";
+	riskTone: (
+		level: ForecastAccountResult["riskLevel"],
+	) => "success" | "warning" | "danger";
+	formatWaitTime: (ms: number) => string;
+	defaultDisplay: DashboardDisplaySettings;
+	loadRuntimeObservabilitySnapshot?: () => Promise<RuntimeForecastOverlay | null>;
+	logInfo?: (message: string) => void;
+	logError?: (message: string) => void;
+	getNow?: () => number;
+}
+
+function joinStyledSegments(
+	parts: string[],
+	styleText: (text: string, tone: PromptTone) => string,
+): string {
+	if (parts.length === 0) return "";
+	return parts.join(styleText(" | ", "muted"));
+}
+
+function printForecastUsage(logInfo: (message: string) => void): void {
+	logInfo(
+		[
+			"Usage:",
+			"  codex-multi-auth forecast [--live] [--json] [--explain] [--model <model>]",
+			"",
+			"Options:",
+			"  --live, -l         Probe live quota headers via Codex backend",
+			"  --json, -j         Print machine-readable JSON output",
+			"  --explain          Include structured recommendation reasoning",
+			`  --model, -m        Probe model for live mode (default: ${DEFAULT_PROBE_MODEL})`,
+			"  --no-runtime-overlay  Ignore persisted runtime skip diagnostics",
+		].join("\n"),
+	);
+}
+
+function parseForecastArgs(
+	args: string[],
+): ParsedArgsResult<ForecastCliOptions> {
+	const options: ForecastCliOptions = {
+		live: false,
+		json: false,
+		explain: false,
+		model: DEFAULT_PROBE_MODEL,
+		modelProvided: false,
+		runtimeOverlay: true,
+	};
+
+	for (let i = 0; i < args.length; i += 1) {
+		const arg = args[i];
+		if (!arg) continue;
+		if (arg === "--live" || arg === "-l") {
+			options.live = true;
+			continue;
+		}
+		if (arg === "--json" || arg === "-j") {
+			options.json = true;
+			continue;
+		}
+		if (arg === "--explain") {
+			options.explain = true;
+			continue;
+		}
+		if (arg === "--no-runtime-overlay") {
+			options.runtimeOverlay = false;
+			continue;
+		}
+		if (arg === "--model" || arg === "-m") {
+			const value = args[i + 1]?.trim();
+			if (!value || value.startsWith("-")) {
+				return { ok: false, message: "Missing value for --model" };
+			}
+			options.model = value;
+			options.modelProvided = true;
+			i += 1;
+			continue;
+		}
+		if (arg.startsWith("--model=")) {
+			const value = arg.slice("--model=".length).trim();
+			if (!value || value.startsWith("-")) {
+				return { ok: false, message: "Missing value for --model" };
+			}
+			options.model = value;
+			options.modelProvided = true;
+			continue;
+		}
+		return { ok: false, message: `Unknown option: ${arg}` };
+	}
+
+	return { ok: true, options };
+}
+
+export async function runForecastCommand(
+	args: string[],
+	deps: ForecastCommandDeps & {
+		formatQuotaSnapshotLine: (snapshot: CodexQuotaSnapshot) => string;
+	},
+): Promise<number> {
+	const logInfo = deps.logInfo ?? console.log;
+	const logError = deps.logError ?? console.error;
+	if (args.includes("--help") || args.includes("-h")) {
+		printForecastUsage(logInfo);
+		return 0;
+	}
+
+	const parsedArgs = parseForecastArgs(args);
+	if (!parsedArgs.ok) {
+		logError(parsedArgs.message);
+		printForecastUsage(logInfo);
+		return 1;
+	}
+	const options = parsedArgs.options;
+	const requestedModel = options.model?.trim() || DEFAULT_PROBE_MODEL;
+	const probeModel = resolveNormalizedModel(requestedModel);
+	const display = deps.loadDashboardDisplaySettings
+		? (await deps.loadDashboardDisplaySettings().catch(() => null)) ??
+			deps.defaultDisplay
+		: deps.defaultDisplay;
+	const quotaCache = await deps.loadQuotaCache();
+	const runtimeOverlay =
+		options.runtimeOverlay && deps.loadRuntimeObservabilitySnapshot
+			? await deps.loadRuntimeObservabilitySnapshot().catch(() => null)
+			: null;
+	const workingQuotaCache = quotaCache
+		? deps.cloneQuotaCacheData(quotaCache)
+		: null;
+	let quotaCacheChanged = false;
+
+	deps.setStoragePath(null);
+	const storage = await deps.loadAccounts();
+	if (!storage || storage.accounts.length === 0) {
+		logInfo("No accounts configured.");
+		return 0;
+	}
+	const quotaEmailFallbackState =
+		options.live && quotaCache
+			? deps.buildQuotaEmailFallbackState(storage.accounts)
+			: null;
+
+	const now = deps.getNow?.() ?? Date.now();
+	const activeIndex = deps.resolveActiveIndex(storage, "codex");
+	const refreshFailures = new Map<number, TokenFailure>();
+	const liveQuotaByIndex = new Map<number, CodexQuotaSnapshot>();
+	const probeErrors: string[] = [];
+
+	for (let i = 0; i < storage.accounts.length; i += 1) {
+		const account = storage.accounts[i];
+		if (!account || !options.live) continue;
+		if (account.enabled === false) continue;
+
+		let probeAccessToken = account.accessToken;
+		let probeAccountId =
+			account.accountId ?? deps.extractAccountId(account.accessToken);
+		if (!deps.hasUsableAccessToken(account, now)) {
+			const refreshResult = await deps.queuedRefresh(account.refreshToken);
+			if (refreshResult.type !== "success") {
+				refreshFailures.set(i, {
+					...refreshResult,
+					message: deps.normalizeFailureDetail(
+						refreshResult.message,
+						refreshResult.reason,
+					),
+				});
+				continue;
+			}
+			const refreshedEmail = sanitizeEmail(
+				extractAccountEmail(refreshResult.access, refreshResult.idToken),
+			);
+			const refreshedAccountId = deps.extractAccountId(refreshResult.access);
+			const previousRefreshToken = account.refreshToken;
+			const previousAccessToken = account.accessToken;
+			const previousExpiresAt = account.expiresAt;
+			const previousEmail = account.email;
+			const previousAccountId = account.accountId;
+			const refreshPatch: RefreshedAccountPatch = {
+				refreshToken: refreshResult.refresh,
+				accessToken: refreshResult.access,
+				expiresAt: refreshResult.expires,
+			};
+			if (refreshedEmail) {
+				refreshPatch.email = refreshedEmail;
+			}
+			if (refreshedAccountId) {
+				refreshPatch.accountId = refreshedAccountId;
+				refreshPatch.accountIdSource = "token";
+			}
+			const accountMatch: AccountIdentityMatch = {
+				refreshToken: previousRefreshToken,
+				email: previousEmail,
+				accountId: previousAccountId,
+			};
+			applyRefreshedAccountPatch(account, refreshPatch);
+			probeAccessToken = refreshResult.access;
+			probeAccountId = account.accountId ?? refreshedAccountId;
+			if (
+				previousRefreshToken !== refreshPatch.refreshToken ||
+				previousAccessToken !== refreshPatch.accessToken ||
+				previousExpiresAt !== refreshPatch.expiresAt ||
+				previousEmail !== account.email ||
+				previousAccountId !== account.accountId
+			) {
+				try {
+					await persistRefreshedAccountPatch(
+						storage,
+						accountMatch,
+						refreshPatch,
+						deps.loadAccounts,
+						deps.saveAccounts,
+					);
+				} catch (error) {
+					const message = deps.normalizeFailureDetail(
+						error instanceof Error ? error.message : String(error),
+						undefined,
+					);
+					probeErrors.push(`${deps.formatAccountLabel(account, i)}: ${message}`);
+					continue;
+				}
+			}
+		}
+
+		if (!probeAccessToken || !probeAccountId) {
+			probeErrors.push(
+				`${deps.formatAccountLabel(account, i)}: missing accountId for live probe`,
+			);
+			continue;
+		}
+
+		try {
+			const liveQuota = await deps.fetchCodexQuotaSnapshot({
+				accountId: probeAccountId,
+				accessToken: probeAccessToken,
+				model: probeModel,
+			});
+			liveQuotaByIndex.set(i, liveQuota);
+			if (workingQuotaCache) {
+				const nextAccount = storage.accounts[i];
+				if (nextAccount) {
+					quotaCacheChanged =
+						deps.updateQuotaCacheForAccount(
+							workingQuotaCache,
+							nextAccount,
+							liveQuota,
+							storage.accounts,
+							quotaEmailFallbackState ?? undefined,
+						) || quotaCacheChanged;
+				}
+			}
+		} catch (error) {
+			const message = describeCodexProbeFailure(error, (raw) =>
+				deps.normalizeFailureDetail(raw, undefined),
+			);
+			probeErrors.push(`${deps.formatAccountLabel(account, i)}: ${message}`);
+		}
+	}
+
+	// Only an explicit --model moves the forecast off the codex family. The
+	// default probe model is gpt-5.6-sol, whose family is gpt-5.2, so keying a
+	// bare `forecast` on it would evaluate every account against a family no
+	// wrapper request uses - /codex/responses buckets into codex.
+	//
+	// probeModel, not requestedModel: rate-limit records are keyed by the
+	// normalized model the proxy routes on. Resolved once rather than per
+	// account: getModelProfile re-parses the model string on every call.
+	const forecastFamily = options.modelProvided
+		? getModelProfile(requestedModel).promptFamily
+		: undefined;
+	const forecastModel = options.modelProvided ? probeModel : undefined;
+	const forecastInputs = storage.accounts.map((account, index) => ({
+		index,
+		account,
+		isCurrent: index === activeIndex,
+		now,
+		refreshFailure: refreshFailures.get(index),
+		liveQuota: liveQuotaByIndex.get(index),
+		quotaCache,
+		allAccounts: storage.accounts,
+		runtimeOverlay,
+		family: forecastFamily,
+		model: forecastModel,
+	}));
+	const forecastResults = deps.evaluateForecastAccounts(forecastInputs);
+	const summary = deps.summarizeForecast(forecastResults);
+	const recommendation = deps.recommendForecastAccount(forecastResults);
+	const explanation = buildForecastExplanation(
+		forecastResults,
+		recommendation,
+	);
+
+	if (options.json) {
+		if (workingQuotaCache && quotaCacheChanged) {
+			try {
+				await deps.saveQuotaCache(workingQuotaCache);
+			} catch (error) {
+				// Quota cache is a derived artifact; a transient Windows EBUSY/
+				// EPERM here must not abort the JSON forecast output.
+				console.warn(
+					`Quota cache save failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
+		logInfo(
+			JSON.stringify(
+				{
+					command: "forecast",
+					model: requestedModel,
+					liveProbe: options.live,
+					runtimeOverlay: options.runtimeOverlay,
+					summary,
+					recommendation,
+					explanation: options.explain ? explanation : undefined,
+					probeErrors,
+					accounts: serializeForecastResults(
+						forecastResults,
+						liveQuotaByIndex,
+						refreshFailures,
+						deps.formatQuotaSnapshotLine,
+					),
+				},
+				null,
+				2,
+			),
+		);
+		return 0;
+	}
+
+	logInfo(
+		deps.stylePromptText(
+			`Best-account preview (${storage.accounts.length} account(s), model ${requestedModel}, live check ${options.live ? "on" : "off"})`,
+			"accent",
+		),
+	);
+	logInfo(
+		deps.formatResultSummary([
+			{ text: `${summary.ready} ready now`, tone: "success" },
+			{ text: `${summary.delayed} waiting`, tone: "warning" },
+			{
+				text: `${summary.unavailable} unavailable`,
+				tone: summary.unavailable > 0 ? "danger" : "muted",
+			},
+			{
+				text: `${summary.highRisk} high risk`,
+				tone: summary.highRisk > 0 ? "danger" : "muted",
+			},
+		]),
+	);
+	logInfo("");
+
+	for (const result of forecastResults) {
+		if (!display.showPerAccountRows) continue;
+		const currentTag = result.isCurrent ? " [current]" : "";
+		const waitLabel =
+			result.waitMs > 0
+				? deps.stylePromptText(
+						`wait ${deps.formatWaitTime(result.waitMs)}`,
+						"muted",
+					)
+				: "";
+		const indexLabel = deps.stylePromptText(`${result.index + 1}.`, "accent");
+		const accountLabel = deps.stylePromptText(
+			`${result.label}${currentTag}`,
+			"accent",
+		);
+		const riskLabel = deps.stylePromptText(
+			`${result.riskLevel} risk (${result.riskScore})`,
+			deps.riskTone(result.riskLevel),
+		);
+		const availabilityLabel = deps.stylePromptText(
+			result.availability,
+			deps.availabilityTone(result.availability),
+		);
+		const rowParts = [availabilityLabel, riskLabel];
+		if (waitLabel) rowParts.push(waitLabel);
+		logInfo(
+			`${indexLabel} ${accountLabel} ${deps.stylePromptText("|", "muted")} ${joinStyledSegments(rowParts, deps.stylePromptText)}`,
+		);
+		if (display.showForecastReasons && result.reasons.length > 0) {
+			logInfo(
+				`   ${deps.stylePromptText(result.reasons.slice(0, 3).join("; "), "muted")}`,
+			);
+		}
+		const liveQuota = liveQuotaByIndex.get(result.index);
+		if (display.showQuotaDetails && liveQuota) {
+			logInfo(
+				`   ${deps.stylePromptText("quota:", "accent")} ${deps.styleQuotaSummary(deps.formatCompactQuotaSnapshot(liveQuota))}`,
+			);
+		}
+	}
+
+	if (!display.showPerAccountRows) {
+		logInfo(
+			deps.stylePromptText(
+				"Per-account lines are hidden in dashboard settings.",
+				"muted",
+			),
+		);
+	}
+
+	if (display.showRecommendations || options.explain) {
+		logInfo("");
+	}
+
+	if (display.showRecommendations) {
+		if (recommendation.recommendedIndex !== null) {
+			const index = recommendation.recommendedIndex;
+			const account = forecastResults.find((result) => result.index === index);
+			if (account) {
+				logInfo(
+					`${deps.stylePromptText("Best next account:", "accent")} ${deps.stylePromptText(`${index + 1} (${account.label})`, "success")}`,
+				);
+				logInfo(
+					`${deps.stylePromptText("Why:", "accent")} ${deps.stylePromptText(recommendation.reason, "muted")}`,
+				);
+				if (index !== activeIndex) {
+					logInfo(
+						`${deps.stylePromptText("Switch now with:", "accent")} codex-multi-auth switch ${index + 1}`,
+					);
+				}
+			}
+		} else {
+			logInfo(
+				`${deps.stylePromptText("Note:", "accent")} ${deps.stylePromptText(recommendation.reason, "muted")}`,
+			);
+		}
+	}
+
+	if (options.explain) {
+		logInfo(
+			`${deps.stylePromptText("Explain:", "accent")} ${deps.stylePromptText(explanation.recommendationReason, "muted")}`,
+		);
+		for (const item of explanation.considered) {
+			const selectedLabel = item.selected ? " selected" : "";
+			const waitLabel =
+				item.waitMs > 0 ? `, wait ${deps.formatWaitTime(item.waitMs)}` : "";
+			logInfo(
+				`  ${deps.stylePromptText(item.selected ? "*" : "-", item.selected ? "success" : "muted")} ${deps.stylePromptText(
+					`${item.index + 1}. ${item.label}${item.isCurrent ? " [current]" : ""}: ${item.availability}, ${item.riskLevel} risk (${item.riskScore})${waitLabel}${selectedLabel}`,
+					item.selected ? "success" : "muted",
+				)}`,
+			);
+			if (item.reasons.length > 0) {
+				logInfo(
+					`    ${deps.stylePromptText(item.reasons.slice(0, 3).join("; "), "muted")}`,
+				);
+			}
+		}
+	}
+
+	if (display.showLiveProbeNotes && probeErrors.length > 0) {
+		logInfo("");
+		logInfo(
+			deps.stylePromptText(
+				`Live check notes (${probeErrors.length}):`,
+				"warning",
+			),
+		);
+		for (const error of probeErrors) {
+			logInfo(
+				`  ${deps.stylePromptText("-", "warning")} ${deps.stylePromptText(error, "muted")}`,
+			);
+		}
+	}
+	if (workingQuotaCache && quotaCacheChanged) {
+		try {
+			await deps.saveQuotaCache(workingQuotaCache);
+		} catch (error) {
+			// Quota cache is a derived artifact; tolerate transient Windows
+			// EBUSY/EPERM rather than aborting the forecast.
+			console.warn(
+				`Quota cache save failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	return 0;
+}

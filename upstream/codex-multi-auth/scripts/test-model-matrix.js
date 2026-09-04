@@ -1,0 +1,687 @@
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(scriptDir, "..");
+const localConfigPaths = [
+	join(repoRoot, ".codex.json"),
+	join(repoRoot, "Codex.json"),
+];
+const scenarioTemplates = {
+	legacy: join(repoRoot, "config", "codex-legacy.json"),
+	modern: join(repoRoot, "config", "codex-modern.json"),
+};
+
+const pluginPackageName = "codex-multi-auth";
+const DEFAULT_MATRIX_TIMEOUT_MS = 120000;
+const DEFAULT_SMOKE_MATRIX_TIMEOUT_MS = 15000;
+
+function resolveCmdScriptEntry(commandPath) {
+	if (!/\.cmd$/i.test(commandPath)) {
+		return null;
+	}
+	try {
+		const raw = readFileSync(commandPath, "utf8");
+		const match = raw.match(/"%dp0%\\([^"\r\n]+\.js)"/i);
+		if (!match || typeof match[1] !== "string") {
+			return null;
+		}
+		const relScriptPath = match[1].replace(/[\\/]+/g, "/");
+		const scriptPath = resolve(dirname(commandPath), relScriptPath);
+		return existsSync(scriptPath) ? scriptPath : null;
+	} catch {
+		return null;
+	}
+}
+
+function buildExecutable(command) {
+	const scriptEntry = resolveCmdScriptEntry(command);
+	if (scriptEntry) {
+		return {
+			command: process.execPath,
+			shell: false,
+			prefixArgs: [scriptEntry],
+			displayCommand: command,
+		};
+	}
+	return { command, shell: /\.cmd$/i.test(command) };
+}
+
+export function resolveCodexExecutable() {
+	const envOverride = process.env.CODEX_BIN;
+	if (envOverride && envOverride.trim().length > 0) {
+		const command = envOverride.trim();
+		return buildExecutable(command);
+	}
+
+	if (process.platform !== "win32") {
+		return { command: "codex", shell: false };
+	}
+
+	const whereResult = spawnSync("where", ["Codex"], {
+		encoding: "utf8",
+		windowsHide: true,
+	});
+	const candidates = `${whereResult.stdout ?? ""}`
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter((line) => /^[A-Za-z]:\\.+\.(exe|cmd)$/i.test(line));
+
+	if (candidates.length === 0) {
+		return { command: "codex", shell: false };
+	}
+
+	const exactExe = candidates.find((candidate) =>
+		/npm\\Codex\.exe$/i.test(candidate),
+	);
+	if (exactExe) {
+		return { command: exactExe, shell: false };
+	}
+
+	const exactCmd = candidates.find((candidate) =>
+		/npm\\Codex\.cmd$/i.test(candidate),
+	);
+	if (exactCmd) {
+		return buildExecutable(exactCmd);
+	}
+
+	const anyCmd = candidates.find((candidate) => /\.cmd$/i.test(candidate));
+	if (anyCmd) {
+		return buildExecutable(anyCmd);
+	}
+
+	return { command: candidates[0], shell: false };
+}
+
+const CodexExecutable = resolveCodexExecutable();
+
+function printUsage() {
+	console.log(
+		[
+			"Usage: node scripts/test-model-matrix.js [options]",
+			"",
+			"Options:",
+			"  --scenario=legacy|modern|all   Which template(s) to audit (default: all)",
+			"  --smoke                         Run reduced per-model checks",
+			"  --plugin=dist|package          Load plugin from local dist URI or package name (default: dist)",
+			"  --max-cases=N                  Hard cap number of cases per scenario",
+			"  --report-json=PATH             Write JSON report to PATH (relative to repo root)",
+			"  --strict-capabilities          Fail unsupported account/model capabilities instead of skipping them",
+			"  --no-restore                   Keep generated local config files after run",
+			"  -h, --help                     Show help",
+		].join("\n"),
+	);
+}
+
+function parseArgValue(args, name) {
+	const prefix = `${name}=`;
+	const hit = args.find((arg) => arg.startsWith(prefix));
+	if (!hit) return undefined;
+	return hit.slice(prefix.length);
+}
+
+function toFileUri(pathValue) {
+	const normalized = pathValue.replace(/\\/g, "/");
+	if (/^[A-Za-z]:\//.test(normalized)) {
+		return `file:///${normalized}`;
+	}
+	if (normalized.startsWith("/")) {
+		return `file://${normalized}`;
+	}
+	return `file:///${normalized}`;
+}
+
+let stopCodexServersQueue = Promise.resolve();
+const spawnedCodexPids = new Set();
+
+function runQuiet(command, commandArgs) {
+	try {
+		spawnSync(command, commandArgs, {
+			stdio: "ignore",
+			windowsHide: true,
+		});
+	} catch {
+		// Ignore cleanup failures.
+	}
+}
+
+function runQuietWindowsTaskkill(pid) {
+	runQuiet("cmd.exe", [
+		"/d",
+		"/s",
+		"/c",
+		`taskkill /F /T /PID ${pid}`,
+	]);
+}
+
+export function registerSpawnedCodex(pid) {
+	if (!Number.isInteger(pid) || pid <= 0) return;
+	spawnedCodexPids.add(pid);
+}
+
+export function __resetTrackedCodexPidsForTests() {
+	spawnedCodexPids.clear();
+}
+
+export function resolveMatrixTimeoutMs(smoke = false) {
+	const fallback = smoke
+		? DEFAULT_SMOKE_MATRIX_TIMEOUT_MS
+		: DEFAULT_MATRIX_TIMEOUT_MS;
+	const parsedTimeout = Number.parseInt(
+		process.env.CODEX_MATRIX_TIMEOUT_MS ?? String(fallback),
+		10,
+	);
+	if (!Number.isFinite(parsedTimeout) || parsedTimeout <= 0) {
+		return fallback;
+	}
+	return parsedTimeout;
+}
+
+function parseNdjsonEvents(output) {
+	const events = [];
+	for (const line of output.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed.startsWith("{")) {
+			continue;
+		}
+		try {
+			events.push(JSON.parse(trimmed));
+		} catch {
+			// Ignore wrapper noise and partial lines.
+		}
+	}
+	return events;
+}
+
+function findLastIndex(items, predicate) {
+	for (let index = items.length - 1; index >= 0; index -= 1) {
+		if (predicate(items[index], index)) {
+			return index;
+		}
+	}
+	return -1;
+}
+
+function hasTerminalFailure(events) {
+	const lastCompletedIndex = findLastIndex(
+		events,
+		(event) =>
+			event?.type === "turn.completed" || event?.type === "response.completed",
+	);
+	return (
+		findLastIndex(
+			events,
+			(event, index) =>
+				index > lastCompletedIndex &&
+				(event?.type === "error" ||
+					event?.type === "turn.failed" ||
+					event?.type === "response.failed" ||
+					event?.type === "response.error" ||
+					event?.type === "response.incomplete"),
+		) >= 0
+	);
+}
+
+function hasCompletedSuccessfully(output, token) {
+	const events = parseNdjsonEvents(output);
+	if (events.length > 0) {
+		if (hasTerminalFailure(events)) {
+			return false;
+		}
+		return events.some(
+			(event) =>
+				event?.type === "turn.completed" ||
+				event?.type === "response.completed",
+		);
+	}
+	return output.includes(token);
+}
+
+function getCapabilitySkipReason(exitCode, output, smoke) {
+	if (/not supported when using codex with a chatgpt account/i.test(output)) {
+		return "unsupported-model";
+	}
+	if (
+		/unsupported value:\s*['"]xhigh['"]/i.test(output) ||
+		/unsupported_value/i.test(output)
+	) {
+		return "unsupported-reasoning";
+	}
+	if (smoke && exitCode === 124) {
+		return "timed-out";
+	}
+	return null;
+}
+
+function finalizeModelCaseResult(
+	caseInfo,
+	exitCode,
+	output,
+	token,
+	{ smoke, strictCapabilities } = {},
+) {
+	const hasToken = output.includes(token);
+	const completed = hasCompletedSuccessfully(output, token);
+	const ok = exitCode === 0 && completed;
+	const skipReason =
+		!ok && strictCapabilities !== true
+			? getCapabilitySkipReason(exitCode, output, smoke === true)
+			: null;
+
+	return {
+		...caseInfo,
+		ok,
+		exitCode,
+		hasToken,
+		completed,
+		skipped: skipReason !== null,
+		skipReason,
+		output,
+	};
+}
+
+export function __finalizeModelCaseResultForTests(
+	caseInfo,
+	exitCode,
+	output,
+	token,
+	smoke = false,
+	strictCapabilities = false,
+) {
+	return finalizeModelCaseResult(caseInfo, exitCode, output, token, {
+		smoke,
+		strictCapabilities,
+	});
+}
+
+function stopCodexServersInternal() {
+	const tracked = [...spawnedCodexPids];
+	spawnedCodexPids.clear();
+	for (const pid of tracked) {
+		if (process.platform === "win32") {
+			runQuietWindowsTaskkill(pid);
+			continue;
+		}
+		runQuiet("kill", ["-9", String(pid)]);
+	}
+}
+
+export function stopCodexServers() {
+	// Avoid overlapping global process cleanup when matrix scripts are run concurrently.
+	stopCodexServersQueue = stopCodexServersQueue.then(async () => {
+		stopCodexServersInternal();
+	});
+	return stopCodexServersQueue;
+}
+
+function normalizePluginList(value, pluginRef) {
+	const entries = Array.isArray(value) ? value.filter(Boolean) : [];
+	const filtered = entries.filter((entry) => {
+		if (typeof entry !== "string") return true;
+		return !entry.startsWith(pluginPackageName);
+	});
+	return [...filtered, pluginRef];
+}
+
+function enumerateCases(models, smoke, maxCases) {
+	const modelEntries = Object.entries(models).sort(([left], [right]) =>
+		left.localeCompare(right),
+	);
+	const cases = [];
+
+	for (const [modelId, modelDef] of modelEntries) {
+		const variants =
+			modelDef && typeof modelDef === "object" && modelDef !== null
+				? modelDef.variants
+				: undefined;
+		const variantNames =
+			variants && typeof variants === "object"
+				? Object.keys(variants).sort()
+				: [];
+
+		cases.push({ model: modelId, variant: undefined });
+		for (const variant of variantNames) {
+			cases.push({ model: modelId, variant });
+		}
+	}
+
+	let selected = cases;
+	if (smoke) {
+		const reduced = [];
+		for (const [modelId, modelDef] of modelEntries) {
+			reduced.push({ model: modelId, variant: undefined });
+			const variants =
+				modelDef && typeof modelDef === "object" && modelDef !== null
+					? modelDef.variants
+					: undefined;
+			const variantNames =
+				variants && typeof variants === "object"
+					? Object.keys(variants).sort()
+					: [];
+			if (variantNames.length > 0) {
+				if (variantNames.includes("high")) {
+					reduced.push({ model: modelId, variant: "high" });
+				} else if (variantNames.includes("medium")) {
+					reduced.push({ model: modelId, variant: "medium" });
+				} else {
+					reduced.push({ model: modelId, variant: variantNames[0] });
+				}
+			}
+		}
+		selected = reduced;
+	}
+
+	if (maxCases > 0 && selected.length > maxCases) {
+		return selected.slice(0, maxCases);
+	}
+	return selected;
+}
+
+function buildModelCaseArgs(caseInfo, index) {
+	const token = `MODEL_MATRIX_OK_${index}`;
+	const args = [
+		"exec",
+		token,
+		"--model",
+		caseInfo.model,
+		"--json",
+		"--skip-git-repo-check",
+	];
+	if (caseInfo.variant) {
+		args.push("-c", `model_reasoning_effort="${caseInfo.variant}"`);
+	}
+	return { token, args };
+}
+
+export function __buildModelCaseArgsForTests(caseInfo, index) {
+	return buildModelCaseArgs(caseInfo, index);
+}
+
+function executeModelCase(caseInfo, index) {
+	const { token, args } = buildModelCaseArgs(caseInfo, index);
+
+	const timeoutMs = resolveMatrixTimeoutMs(caseInfo.smoke === true);
+	const commandArgs = [...(CodexExecutable.prefixArgs ?? []), ...args];
+	const finalized = spawnSync(CodexExecutable.command, commandArgs, {
+		cwd: repoRoot,
+		encoding: "utf8",
+		windowsHide: true,
+		shell: CodexExecutable.shell,
+		timeout: timeoutMs,
+		killSignal: "SIGKILL",
+		env: {
+			...process.env,
+			ENABLE_PLUGIN_REQUEST_LOGGING: "0",
+			CODEX_PLUGIN_LOG_BODIES: "0",
+			DEBUG_CODEX_PLUGIN: "0",
+		},
+	});
+
+	if (finalized.error && finalized.error.code === "ETIMEDOUT") {
+		return finalizeModelCaseResult(
+			caseInfo,
+			124,
+			`Timed out after ${timeoutMs}ms`,
+			token,
+			{
+				smoke: caseInfo.smoke === true,
+				strictCapabilities: caseInfo.strictCapabilities === true,
+			},
+		);
+	}
+
+	const combinedOutput =
+		`${finalized.stdout ?? ""}\n${finalized.stderr ?? ""}`.trim();
+	const exitCode = finalized.status ?? 1;
+	return finalizeModelCaseResult(
+		caseInfo,
+		exitCode,
+		combinedOutput,
+		token,
+		{
+			smoke: caseInfo.smoke === true,
+			strictCapabilities: caseInfo.strictCapabilities === true,
+		},
+	);
+}
+
+async function readJson(pathValue) {
+	return JSON.parse(await readFile(pathValue, "utf8"));
+}
+
+async function writeJson(pathValue, value) {
+	await writeFile(pathValue, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+async function backupLocalConfigs() {
+	const backups = new Map();
+	for (const configPath of localConfigPaths) {
+		if (existsSync(configPath)) {
+			backups.set(configPath, await readFile(configPath, "utf8"));
+		} else {
+			backups.set(configPath, null);
+		}
+	}
+	return backups;
+}
+
+async function restoreLocalConfigs(backups) {
+	for (const [configPath, content] of backups.entries()) {
+		if (content === null) {
+			if (existsSync(configPath)) {
+				await rm(configPath, { force: true });
+			}
+			continue;
+		}
+		await writeFile(configPath, content, "utf8");
+	}
+}
+
+function resolvePluginReference(mode) {
+	if (mode === "package") {
+		return pluginPackageName;
+	}
+	const distEntry = join(repoRoot, "dist", "index.js");
+	if (!existsSync(distEntry)) {
+		throw new Error(
+			`dist build missing at ${distEntry}. Run 'npm run build' before matrix audit.`,
+		);
+	}
+	return toFileUri(join(repoRoot, "dist"));
+}
+
+async function prepareScenarioConfig(templatePath, pluginRef) {
+	const config = await readJson(templatePath);
+	config.plugin = normalizePluginList(config.plugin, pluginRef);
+	for (const configPath of localConfigPaths) {
+		await writeJson(configPath, config);
+	}
+	return config;
+}
+
+async function runScenario(scenario, options) {
+	const templatePath = scenarioTemplates[scenario];
+	if (!templatePath || !existsSync(templatePath)) {
+		throw new Error(
+			`Template not found for scenario '${scenario}': ${templatePath}`,
+		);
+	}
+
+	const config = await prepareScenarioConfig(templatePath, options.pluginRef);
+	const models = config?.provider?.openai?.models;
+	if (!models || typeof models !== "object") {
+		throw new Error(
+			`Scenario '${scenario}' has no provider.openai.models object`,
+		);
+	}
+
+	const cases = enumerateCases(models, options.smoke, options.maxCases).map(
+		(caseInfo) => ({
+			...caseInfo,
+			smoke: options.smoke,
+			strictCapabilities: options.strictCapabilities,
+		}),
+	);
+	console.log(`\n=== ${scenario.toUpperCase()} (${cases.length} cases) ===`);
+
+	const results = [];
+	for (let i = 0; i < cases.length; i += 1) {
+		const caseInfo = cases[i];
+		const result = executeModelCase(caseInfo, i + 1);
+		results.push(result);
+		const variantLabel = result.variant ? ` [variant=${result.variant}]` : "";
+		if (result.ok) {
+			console.log(`PASS  ${result.model}${variantLabel}`);
+		} else if (result.skipped) {
+			console.log(
+				`SKIP  ${result.model}${variantLabel} (${result.skipReason})`,
+			);
+		} else {
+			console.log(
+				`FAIL  ${result.model}${variantLabel} (exit=${result.exitCode}, token=${result.hasToken})`,
+			);
+			const tail = result.output.split(/\r?\n/).slice(-12).join("\n");
+			if (tail.trim().length > 0) {
+				console.log(tail);
+			}
+		}
+	}
+
+	return results;
+}
+
+async function main() {
+	const args = process.argv.slice(2);
+	if (args.includes("--help") || args.includes("-h")) {
+		printUsage();
+		return;
+	}
+
+	const smoke = args.includes("--smoke");
+	const scenarioValue =
+		parseArgValue(args, "--scenario") ?? (smoke ? "modern" : "all");
+	const pluginMode = parseArgValue(args, "--plugin") ?? "dist";
+	const strictCapabilities = args.includes("--strict-capabilities");
+	const noRestore = args.includes("--no-restore");
+	const maxCasesRaw = parseArgValue(args, "--max-cases");
+	const maxCases = maxCasesRaw ? Number.parseInt(maxCasesRaw, 10) : 0;
+	const reportJsonPathRaw = parseArgValue(args, "--report-json");
+	const reportJsonPath = reportJsonPathRaw
+		? resolve(repoRoot, reportJsonPathRaw)
+		: undefined;
+
+	if (!["all", "legacy", "modern"].includes(scenarioValue)) {
+		throw new Error(
+			`Invalid --scenario value '${scenarioValue}'. Use legacy, modern, or all.`,
+		);
+	}
+	if (!["dist", "package"].includes(pluginMode)) {
+		throw new Error(
+			`Invalid --plugin value '${pluginMode}'. Use dist or package.`,
+		);
+	}
+	if (Number.isNaN(maxCases) || maxCases < 0) {
+		throw new Error(
+			`Invalid --max-cases value '${maxCasesRaw}'. Use a non-negative integer.`,
+		);
+	}
+
+	const pluginRef = resolvePluginReference(pluginMode);
+	const scenarios =
+		scenarioValue === "all" ? ["legacy", "modern"] : [scenarioValue];
+
+	console.log("Codex Model Matrix Audit");
+	console.log(`Repo: ${repoRoot}`);
+	console.log(`Scenarios: ${scenarios.join(", ")}`);
+	console.log(`Mode: ${smoke ? "smoke" : "full"}`);
+	console.log(`Plugin: ${pluginRef}`);
+	console.log(
+		`Codex command: ${CodexExecutable.displayCommand ?? CodexExecutable.command}`,
+	);
+
+	const backups = await backupLocalConfigs();
+	const allResults = [];
+	try {
+		for (let i = 0; i < scenarios.length; i += 1) {
+			const scenario = scenarios[i];
+			await stopCodexServers();
+			const scenarioResults = await runScenario(scenario, {
+				smoke,
+				maxCases,
+				pluginRef,
+				strictCapabilities,
+			});
+			allResults.push(
+				...scenarioResults.map((item) => ({ ...item, scenario })),
+			);
+		}
+	} finally {
+		if (!noRestore) {
+			await restoreLocalConfigs(backups);
+		}
+	}
+
+	const passed = allResults.filter((result) => result.ok);
+	const skipped = allResults.filter((result) => result.skipped);
+	const failed = allResults.filter((result) => !result.ok && !result.skipped);
+	console.log("\n=== SUMMARY ===");
+	console.log(`Total: ${allResults.length}`);
+	console.log(`Passed: ${passed.length}`);
+	console.log(`Skipped: ${skipped.length}`);
+	console.log(`Failed: ${failed.length}`);
+
+	if (reportJsonPath) {
+		const report = {
+			generatedAt: new Date().toISOString(),
+			repoRoot,
+			scenarios,
+			mode: smoke ? "smoke" : "full",
+			plugin: pluginRef,
+			CodexCommand: CodexExecutable.displayCommand ?? CodexExecutable.command,
+			totals: {
+				total: allResults.length,
+				passed: passed.length,
+				skipped: skipped.length,
+				failed: failed.length,
+			},
+			results: allResults,
+		};
+		await mkdir(dirname(reportJsonPath), { recursive: true });
+		await writeFile(
+			reportJsonPath,
+			`${JSON.stringify(report, null, 2)}\n`,
+			"utf8",
+		);
+		console.log(`Report written: ${reportJsonPath}`);
+	}
+
+	if (failed.length > 0) {
+		console.log("\nFailed cases:");
+		for (const result of failed) {
+			const variantLabel = result.variant ? ` [variant=${result.variant}]` : "";
+			console.log(`- ${result.scenario}: ${result.model}${variantLabel}`);
+		}
+		process.exitCode = 1;
+	} else if (smoke && passed.length === 0) {
+		console.log(
+			"\nSmoke matrix was inconclusive: all cases were skipped for this current runtime/account capability set.",
+		);
+	}
+}
+
+const isDirectRun =
+	process.argv.length > 1 &&
+	resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isDirectRun) {
+	main().catch((error) => {
+		console.error(
+			`Model matrix audit failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		process.exit(1);
+	});
+}

@@ -1,0 +1,332 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { promises as fs } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { removeWithRetry } from "./helpers/remove-with-retry.js";
+
+const loadUnifiedPluginConfigSyncMock = vi.fn(() => null);
+
+vi.mock("../lib/unified-settings.js", () => ({
+	getUnifiedSettingsPath: () => "/mock/unified-settings.json",
+	loadUnifiedPluginConfigSync: loadUnifiedPluginConfigSyncMock,
+	saveUnifiedPluginConfig: vi.fn(),
+}));
+
+let tempConfigCounter = 0;
+const tempConfigPaths = new Set<string>();
+
+function nextConfigPath(label: string): string {
+	tempConfigCounter += 1;
+	const configPath = join(
+		tmpdir(),
+		`config-explain-${label}-${tempConfigCounter}.json`,
+	);
+	tempConfigPaths.add(configPath);
+	return configPath;
+}
+
+function expectEntry(
+	report: { entries: Array<{ key: string }> },
+	key: string,
+) {
+	const entry = report.entries.find((item) => item.key === key);
+	expect(entry).toBeDefined();
+	return entry;
+}
+
+describe("getPluginConfigExplainReport", () => {
+	afterEach(async () => {
+		delete process.env.CODEX_MODE;
+		delete process.env.CODEX_AUTH_FAST_SESSION_STRATEGY;
+		delete process.env.CODEX_MULTI_AUTH_CONFIG_PATH;
+		delete process.env.CODEX_AUTH_RATE_LIMIT_DEDUP_WINDOW_MS;
+		delete process.env.CODEX_AUTH_RATE_LIMIT_STATE_RESET_MS;
+		delete process.env.CODEX_AUTH_RATE_LIMIT_MAX_BACKOFF_MS;
+		delete process.env.CODEX_AUTH_RATE_LIMIT_SHORT_RETRY_THRESHOLD_MS;
+		for (const configPath of tempConfigPaths) {
+			await removeWithRetry(configPath, { force: true }).catch(() => {});
+		}
+		tempConfigPaths.clear();
+		loadUnifiedPluginConfigSyncMock.mockReset();
+		loadUnifiedPluginConfigSyncMock.mockReturnValue(null);
+		vi.resetModules();
+	});
+
+	it('marks entries sourced from unified settings as "unified"', async () => {
+		loadUnifiedPluginConfigSyncMock.mockReturnValue({
+			unsupportedCodexPolicy: "fallback",
+		});
+		const { getPluginConfigExplainReport } = await import("../lib/config.js");
+
+		const report = getPluginConfigExplainReport();
+		const entry = report.entries.find(
+			(item) => item.key === "unsupportedCodexPolicy",
+		);
+
+		expect(report.storageKind).toBe("unified");
+		expect(entry).toBeDefined();
+		expect(entry?.source).toBe("unified");
+	});
+
+	it("treats invalid string env values as non-env sources", async () => {
+		process.env.CODEX_AUTH_FAST_SESSION_STRATEGY = "bogus";
+		const { getPluginConfigExplainReport } = await import("../lib/config.js");
+		const report = getPluginConfigExplainReport();
+		const entry = report.entries.find(
+			(item) => item.key === "fastSessionStrategy",
+		);
+		expect(entry).toBeDefined();
+		expect(entry?.source).not.toBe("env");
+	});
+
+	it("attributes alias-backed fallback policy values to stored config", async () => {
+		const configPath = nextConfigPath("alias");
+		process.env.CODEX_MULTI_AUTH_CONFIG_PATH = configPath;
+		await fs.writeFile(
+			configPath,
+			JSON.stringify({ fallbackOnUnsupportedCodexModel: true }, null, 2),
+			"utf-8",
+		);
+		const { getPluginConfigExplainReport } = await import("../lib/config.js");
+		const report = getPluginConfigExplainReport();
+		const policy = expectEntry(report, "unsupportedCodexPolicy");
+		const fallback = expectEntry(report, "fallbackOnUnsupportedCodexModel");
+		expect(policy?.source).toBe("file");
+		expect(fallback?.source).toBe("file");
+	});
+
+	it("reports missing config files as none", async () => {
+		process.env.CODEX_MULTI_AUTH_CONFIG_PATH = nextConfigPath("missing");
+		const { getPluginConfigExplainReport } = await import("../lib/config.js");
+		const report = getPluginConfigExplainReport();
+		const entry = expectEntry(report, "codexMode");
+		expect(report.storageKind).toBe("none");
+		expect(entry?.source).toBe("default");
+	});
+
+	it("attributes stored single-key defaults to file config", async () => {
+		const configPath = nextConfigPath("single-key-default");
+		process.env.CODEX_MULTI_AUTH_CONFIG_PATH = configPath;
+		await fs.writeFile(
+			configPath,
+			JSON.stringify({ codexMode: true }, null, 2),
+			"utf-8",
+		);
+		const { getPluginConfigExplainReport } = await import("../lib/config.js");
+		const report = getPluginConfigExplainReport();
+		const entry = expectEntry(report, "codexMode");
+		expect(report.storageKind).toBe("file");
+		expect(entry?.source).toBe("file");
+	});
+
+	it("reports unreadable config files consistently", async () => {
+		const configPath = nextConfigPath("malformed");
+		process.env.CODEX_MULTI_AUTH_CONFIG_PATH = configPath;
+		await fs.writeFile(configPath, "{ malformed-json", "utf-8");
+		const { getPluginConfigExplainReport } = await import("../lib/config.js");
+		const report = getPluginConfigExplainReport();
+		const policy = expectEntry(report, "unsupportedCodexPolicy");
+		const fallback = expectEntry(report, "fallbackOnUnsupportedCodexModel");
+		expect(report.storageKind).toBe("unreadable");
+		expect(policy?.source).not.toBe("file");
+		expect(fallback?.source).not.toBe("file");
+	});
+
+	it("reports retry-all max retries honestly for json-safe output", async () => {
+		const { getPluginConfigExplainReport } = await import("../lib/config.js");
+		const report = getPluginConfigExplainReport();
+		const entry = expectEntry(report, "retryAllAccountsMaxRetries");
+		expect(entry?.value).toBe(0);
+		expect(entry?.defaultValue).toBe(0);
+		const serialized = JSON.parse(JSON.stringify(report)) as {
+			entries: Array<{ key: string; value: unknown; defaultValue: unknown }>;
+		};
+		const serializedEntry = serialized.entries.find(
+			(item) => item.key === "retryAllAccountsMaxRetries",
+		);
+		expect(serializedEntry).toMatchObject({
+			value: 0,
+			defaultValue: 0,
+		});
+	});
+
+	it("covers the rate-limit explain rows and env sources", async () => {
+		const { getPluginConfigExplainReport } = await import("../lib/config.js");
+		const keys = [
+			"rateLimitDedupWindowMs",
+			"rateLimitStateResetMs",
+			"rateLimitMaxBackoffMs",
+			"rateLimitShortRetryThresholdMs",
+		] as const;
+		const report = getPluginConfigExplainReport();
+		for (const key of keys) {
+			expect(expectEntry(report, key)).toBeDefined();
+		}
+
+		const serialized = JSON.parse(JSON.stringify(report)) as {
+			entries: Array<{ key: string; value: unknown; defaultValue: unknown; source: string }>;
+		};
+		for (const key of keys) {
+			const entry = serialized.entries.find((item) => item.key === key);
+			expect(entry).toBeDefined();
+			expect(entry?.value).toBeDefined();
+			expect(entry?.defaultValue).toBeDefined();
+		}
+
+		vi.resetModules();
+		process.env.CODEX_AUTH_RATE_LIMIT_DEDUP_WINDOW_MS = "3210";
+		process.env.CODEX_AUTH_RATE_LIMIT_STATE_RESET_MS = "654321";
+		process.env.CODEX_AUTH_RATE_LIMIT_MAX_BACKOFF_MS = "12345";
+		process.env.CODEX_AUTH_RATE_LIMIT_SHORT_RETRY_THRESHOLD_MS = "250";
+		const envMod = await import("../lib/config.js");
+		const envReport = envMod.getPluginConfigExplainReport();
+		for (const key of keys) {
+			const entry = expectEntry(envReport, key);
+			expect(entry?.source).toBe("env");
+		}
+	});
+
+	it("reports default and env sources", async () => {
+		const mod = await import("../lib/config.js");
+		let report = mod.getPluginConfigExplainReport();
+		let entry = report.entries.find((item) => item.key === "codexMode");
+		expect(entry).toBeDefined();
+		expect(entry?.source).toBe("default");
+		expect(report.storageKind).toBe("none");
+		vi.resetModules();
+
+		process.env.CODEX_AUTH_FAST_SESSION_STRATEGY = "always";
+		const modWithEnv = await import("../lib/config.js");
+		report = modWithEnv.getPluginConfigExplainReport();
+		entry = report.entries.find((item) => item.key === "fastSessionStrategy");
+		expect(entry).toBeDefined();
+		expect(entry?.source).toBe("env");
+	});
+
+	// Parity guard (config-07): every key in DEFAULT_PLUGIN_CONFIG must have a
+	// corresponding `config explain` entry. This prevents the class of drift where a
+	// new setting is added to the config + schema but forgotten in
+	// CONFIG_EXPLAIN_ENTRIES (the original config-01; the beta.2 token-invalidation
+	// keys were the most recent near-miss). If this fails, add the missing entry.
+	it("explains every key in DEFAULT_PLUGIN_CONFIG (no drift)", async () => {
+		const mod = await import("../lib/config.js");
+		const report = mod.getPluginConfigExplainReport();
+		const explained = new Set(report.entries.map((item) => item.key));
+		const configKeys = Object.keys(mod.DEFAULT_PLUGIN_CONFIG);
+		const missing = configKeys.filter((key) => !explained.has(key));
+		expect(missing).toEqual([]);
+	});
+
+	// config-01 (bidirectional): the parity guard must also fail if `config explain`
+	// keeps a stale or renamed entry after a config key is removed/renamed —
+	// otherwise drift in the other direction goes unnoticed.
+	it("has no extra explain entries beyond DEFAULT_PLUGIN_CONFIG keys", async () => {
+		const mod = await import("../lib/config.js");
+		const report = mod.getPluginConfigExplainReport();
+		const configKeys = new Set(Object.keys(mod.DEFAULT_PLUGIN_CONFIG));
+		const extras = report.entries
+			.map((item) => item.key)
+			.filter((key) => !configKeys.has(key));
+		expect(extras).toEqual([]);
+	});
+
+	// config-01 (precedence): when CODEX_MULTI_AUTH_CONFIG_PATH is set and present,
+	// loadPluginConfig() reads that file in preference to unified settings, so the
+	// explain report must describe the SAME file (storageKind "file" + that path),
+	// not the unified store. Regression for the split-brain where explain reported
+	// unified while load read the env file.
+	it('reports the env config path as the "file" source when CODEX_MULTI_AUTH_CONFIG_PATH is set', async () => {
+		const configPath = nextConfigPath("env-precedence");
+		await fs.writeFile(
+			configPath,
+			JSON.stringify({ unsupportedCodexPolicy: "fallback" }),
+			"utf-8",
+		);
+		// Unified settings also present — env path must still win.
+		loadUnifiedPluginConfigSyncMock.mockReturnValue({
+			unsupportedCodexPolicy: "strict",
+		});
+		process.env.CODEX_MULTI_AUTH_CONFIG_PATH = configPath;
+
+		const { getPluginConfigExplainReport } = await import("../lib/config.js");
+		const report = getPluginConfigExplainReport();
+
+		expect(report.storageKind).toBe("file");
+		expect(report.configPath).toBe(configPath);
+		const entry = expectEntry(report, "unsupportedCodexPolicy");
+		expect(entry?.source).toBe("file");
+		expect(entry?.value).toBe("fallback");
+	});
+
+	// config-08 (transient lock): getPluginConfigExplainReport() reads the stored
+	// record via readConfigRecordFromPath(), which used a single-shot readFileSync
+	// with NO retry — so a transient Windows EBUSY/EPERM/EAGAIN made the explain
+	// report say storageKind "unreadable" even though loadPluginConfig() (which
+	// uses readFileSyncWithConfigRetry) succeeded after retrying. That split-brain
+	// is the regression: load succeeds, explain reports unreadable. After the fix,
+	// readConfigRecordFromPath() reuses the same bounded retry, so a transient lock
+	// no longer produces a false "unreadable".
+	//
+	// Call sequence with CODEX_MULTI_AUTH_CONFIG_PATH set + present:
+	//   read #1  loadPluginConfig() env read              -> succeeds
+	//   read #2  readConfigRecordFromPath() env read       -> EBUSY (throw once)
+	//   read #3  readConfigRecordFromPath() retry          -> succeeds (fixed code)
+	// Old single-shot code stops at #2 and reports "unreadable"; the retry recovers.
+	it("retries a transient lock instead of reporting the env config as unreadable", async () => {
+		const configPath = nextConfigPath("transient-lock");
+		process.env.CODEX_MULTI_AUTH_CONFIG_PATH = configPath;
+		const validJson = JSON.stringify({ unsupportedCodexPolicy: "fallback" });
+
+		let configReadCalls = 0;
+		vi.doMock("node:fs", async () => {
+			const actual =
+				await vi.importActual<typeof import("node:fs")>("node:fs");
+			return {
+				...actual,
+				existsSync: (target: Parameters<typeof actual.existsSync>[0]) =>
+					target === configPath ? true : actual.existsSync(target),
+				readFileSync: ((
+					target: unknown,
+					...rest: unknown[]
+				) => {
+					if (target === configPath) {
+						configReadCalls += 1;
+						// Throw a single transient EBUSY on the readConfigRecordFromPath
+						// read (the 2nd call); loadPluginConfig's earlier read (#1) and the
+						// retry (#3) both succeed.
+						if (configReadCalls === 2) {
+							const error = new Error(
+								"EBUSY: resource busy or locked",
+							) as NodeJS.ErrnoException;
+							error.code = "EBUSY";
+							throw error;
+						}
+						return validJson;
+					}
+					return (
+						actual.readFileSync as (...args: unknown[]) => unknown
+					)(target, ...rest);
+				}) as typeof actual.readFileSync,
+			};
+		});
+
+		try {
+			const { getPluginConfigExplainReport } =
+				await import("../lib/config.js");
+			const report = getPluginConfigExplainReport();
+
+			// The transient EBUSY hit readConfigRecordFromPath but the retry recovered,
+			// so the report must NOT be "unreadable" — it matches the loaded file.
+			expect(report.storageKind).not.toBe("unreadable");
+			expect(report.storageKind).toBe("file");
+			expect(report.configPath).toBe(configPath);
+			// Confirms the EBUSY was actually exercised + a retry happened (>= 3 reads).
+			expect(configReadCalls).toBeGreaterThanOrEqual(3);
+			const entry = expectEntry(report, "unsupportedCodexPolicy");
+			expect(entry?.source).toBe("file");
+			expect(entry?.value).toBe("fallback");
+		} finally {
+			vi.doUnmock("node:fs");
+		}
+	});
+});

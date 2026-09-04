@@ -1,0 +1,190 @@
+import { AUTH_REDIRECT } from "../auth/auth.js";
+
+export const UI_COPY = {
+	mainMenu: {
+		title: "Accounts Dashboard",
+		searchSubtitlePrefix: "Search:",
+		quickStart: "Quick Actions",
+		addAccount: "Add New Account",
+		checkAccounts: "Run Health Check",
+		bestAccount: "Pick Best Account",
+		fixIssues: "Auto-Repair Issues",
+		settings: "Settings",
+		moreChecks: "Advanced Checks",
+		refreshChecks: "Refresh All Accounts",
+		checkFlagged: "Check Problem Accounts",
+		accounts: "Saved Accounts",
+		loadingLimits: "Fetching account limits...",
+		noSearchMatches: "No accounts match your search",
+		dangerZone: "Danger Zone",
+		removeAllAccounts: "Delete All Accounts",
+		helpCompact: "↑↓ Move | Enter Select | / Search | 1-9 Switch | Q Back",
+		helpDetailed:
+			"Arrow keys move, Enter selects, / searches, 1-9 switches account, Q goes back",
+	},
+	accountDetails: {
+		back: "Back",
+		enable: "Enable Account",
+		disable: "Disable Account",
+		setCurrent: "Set As Current",
+		refresh: "Re-Login",
+		remove: "Delete Account",
+		help: "↑↓ Move | Enter Select | S Use | R Sign In | D Delete | Q Back",
+	},
+	oauth: {
+		chooseModeTitle: "Get Started",
+		chooseModeSubtitle: "Choose how you want to continue.",
+		signInHeading: "Sign in",
+		restoreHeading: "Recover saved accounts",
+		openBrowser: "Open Browser (Easy)",
+		manualMode: "Manual / Incognito",
+		restoreSavedBackup: "Restore Saved Backup",
+		loadLastBackup: "Load Last Saved Backup (Recommended)",
+		chooseBackupManually: "Choose Backup Manually",
+		back: "Back",
+		chooseModeHelp: "↑↓ Move | Enter Select | 1 Easy | 2 Manual | Q Back",
+		chooseModeHelpWithBackup:
+			"↑↓ Move | Enter Select | 1 Easy | 2 Manual | 3 Backup | Q Back",
+		restoreBackupTitle: "Restore Saved Backup",
+		restoreBackupSubtitle: "Choose how you want to recover saved accounts.",
+		restoreBackupLatestHint: "Fastest way to recover your saved accounts.",
+		restoreBackupHelp: "↑↓ Move | Enter Select | 1 Latest | 2 Manual | Q Back",
+		manualBackupTitle: "Choose Backup",
+		manualBackupSubtitle: "Pick a saved backup to restore.",
+		manualBackupHelp: "↑↓ Move | Enter Select | Q Back",
+		loadLastBackupHint: (
+			fileName: string,
+			accountCount: number,
+			savedAt: string,
+		) =>
+			`${fileName} | ${accountCount} account${accountCount === 1 ? "" : "s"} | saved ${savedAt}`,
+		manualBackupHint: (accountCount: number, savedAt: string) =>
+			`${accountCount} account${accountCount === 1 ? "" : "s"} | saved ${savedAt}`,
+		restoreBackupConfirm: (fileName: string, accountCount: number) =>
+			`Load ${fileName} (${accountCount} account${accountCount === 1 ? "" : "s"})?`,
+		restoreBackupLoaded: (fileName: string, accountCount: number) =>
+			`Loaded ${fileName} (${accountCount} account${accountCount === 1 ? "" : "s"}).`,
+		restoreBackupSyncWarning:
+			"Backup loaded locally, but Codex auth sync did not complete. Multi-auth routing will still use the restored account pool.",
+		goTo: "Go to:",
+		copyOk: "Login link copied.",
+		copyFail: "Could not copy login link.",
+		pastePrompt: "Paste callback URL or code here (Q to cancel):",
+		browserOpened: "Browser opened.",
+		browserOpenFail: "Could not open browser. Use this link:",
+		waitingCallback: `Waiting for login callback on ${AUTH_REDIRECT.host}:${AUTH_REDIRECT.port}...`,
+		callbackBypassed: "Manual mode active. Paste the callback URL manually.",
+		callbackUnavailable:
+			"Callback listener unavailable. Paste the callback URL manually.",
+		callbackMissed: "No callback received. Paste manually.",
+		cancelled: "Sign-in cancelled.",
+		cancelledBackToMenu: "Sign-in cancelled. Going back to menu.",
+		callbackInvalid:
+			"That callback URL is missing the code or state parameter. Paste the full URL you were redirected to (it should contain both code= and state=).",
+		callbackStateMismatch:
+			"OAuth state mismatch. That callback URL was generated for a different login attempt. Restart login and paste the callback URL from this attempt.",
+	},
+	returnFlow: {
+		continuePrompt: "Press Enter to go back.",
+		actionFailedPrompt: "Action failed. Press Enter to go back.",
+		autoReturn: (seconds: number) =>
+			`Returning in ${seconds}s... Press any key to pause.`,
+		paused: "Paused. Press any key to continue.",
+		working: "Running...",
+		done: "Done.",
+		failed: "Failed.",
+	},
+	settings: {
+		title: "Settings",
+		subtitle: "Customize menu, behavior, backend, and experiments",
+		help: "↑↓ Move | Enter Select | Q Back",
+		sectionTitle: "Basic",
+		advancedTitle: "Advanced",
+		exitTitle: "Back",
+		accountList: "Account List View",
+		summaryFields: "Summary Line",
+		behavior: "Menu Behavior",
+		theme: "Color Theme",
+		experimental: "Experimental",
+		experimentalTitle: "Experimental",
+		experimentalSubtitle:
+			"Preview sync and backup actions before they become stable",
+		experimentalHelpMenu:
+			"Enter Select | 1 Sync | 2 Backup | 3 Guard | [ - Down | ] + Up | S Save | Q Back",
+		experimentalHelpPreview: "Enter Select | A Apply | Q Back",
+		experimentalHelpStatus: "Enter Select | Q Back",
+		experimentalSync: "Sync Accounts to oc-chatgpt-multi-auth",
+		experimentalApplySync: "Apply Sync",
+		experimentalBackup: "Save Pool Backup",
+		experimentalBackupPrompt: "Backup file name (.json): ",
+		experimentalRefreshGuard: "Enable Refresh Guard",
+		experimentalRefreshInterval: "Refresh Guard Interval",
+		experimentalDecreaseInterval: "Decrease Refresh Interval",
+		experimentalIncreaseInterval: "Increase Refresh Interval",
+		backend: "Backend Controls",
+		back: "Back",
+		previewHeading: "Live Preview",
+		displayHeading: "Options",
+		resetDefault: "Reset to Default",
+		saveAndBack: "Save and Back",
+		backNoSave: "Back Without Saving",
+		accountListTitle: "Account List View",
+		accountListSubtitle: "Choose row details and optional smart sorting",
+		accountListHelp:
+			"Enter Toggle | Number Toggle | M Sort | L Layout | S Save | Q Back (No Save)",
+		summaryTitle: "Account Details Row",
+		summarySubtitle: "Choose and order detail fields",
+		summaryHelp:
+			"Enter Toggle | 1-3 Toggle | [ ] Reorder | S Save | Q Back (No Save)",
+		behaviorTitle: "Return Behavior",
+		behaviorSubtitle: "Control how result screens return",
+		behaviorHelp:
+			"Enter Select | 1-3 Delay | P Pause | L AutoFetch | F Status | T TTL | S Save | Q Back (No Save)",
+		themeTitle: "Color Theme",
+		themeSubtitle: "Pick base color and accent",
+		themeHelp: "Enter Select | 1-2 Base | S Save | Q Back (No Save)",
+		backendTitle: "Backend Controls",
+		backendSubtitle: "Tune sync, retry, and limit behavior",
+		backendHelp:
+			"Enter Open | 1-4 Category | S Save | R Reset | Q Back (No Save)",
+		backendCategoriesHeading: "Categories",
+		backendCategoryTitle: "Backend Category",
+		backendCategoryHelp:
+			"Enter Toggle/Adjust | +/- or [ ] Number | 1-9 Toggle | R Reset | Q Back",
+		backendToggleHeading: "Switches",
+		backendNumberHeading: "Numbers",
+		backendDecrease: "Decrease Focused Value",
+		backendIncrease: "Increase Focused Value",
+		backendResetCategory: "Reset Category",
+		backendBackToCategories: "Back to Categories",
+		baseTheme: "Base Color",
+		accentColor: "Accent Color",
+		actionTiming: "Auto Return Delay",
+		moveUp: "Move Focused Field Up",
+		moveDown: "Move Focused Field Down",
+	},
+	fallback: {
+		addAnotherTip:
+			"Tip: Use private mode or sign out before adding another account.",
+		addAnotherQuestion: (count: number) =>
+			`Add another account? (${count} added) (y/n): `,
+		selectModePrompt:
+			"(a) add, (c) check, (b) best, fi(x), (s) settings, (d) deep, (g) problem, (f) fresh, (q) back [a/c/b/x/s/d/g/f/q]: ",
+		invalidModePrompt: "Use one of: a, c, b, x, s, d, g, f, q.",
+	},
+} as const;
+
+/**
+ * Builds the "Check Problem Accounts" label, appending the flagged count when greater than zero.
+ *
+ * This function is pure and has no side effects, is safe for concurrent use, performs no filesystem
+ * access (including Windows-specific behavior), and does not perform any token redaction.
+ *
+ * @param flaggedCount - The number of flagged accounts to show; if greater than zero the count is appended in parentheses.
+ * @returns The resulting label string: the base label when `flaggedCount` is 0 or less, otherwise the base label followed by ` (count)`.
+ */
+export function formatCheckFlaggedLabel(flaggedCount: number): string {
+	return flaggedCount > 0
+		? `${UI_COPY.mainMenu.checkFlagged} (${flaggedCount})`
+		: UI_COPY.mainMenu.checkFlagged;
+}

@@ -1,0 +1,15 @@
+{
+  "$schema": "./schema/config.schema.json",
+  "plugin": ["codex-multi-auth"],
+
+  "provider": {
+    "openai": {
+      "options": {
+        "store": false
+      }
+    }
+  },
+  "model": "openai/gpt-5.3-codex"
+}
+
+

@@ -1,0 +1,582 @@
+import {
+	AUTH_INVALIDATION_MARKER,
+	formatAccountLabel,
+	formatWaitTime,
+} from "./accounts.js";
+import type { CodexQuotaSnapshot } from "./quota-probe.js";
+import type { QuotaCacheData } from "./quota-cache.js";
+import {
+	findQuotaCacheEntryForAccount,
+	isQuotaCacheEntryExhausted,
+	quotaUsedPercentIsExhausted,
+} from "./quota-readiness.js";
+import type { ModelFamily } from "./request/helpers/model-map.js";
+import {
+	getRateLimitResetTimeForFamily,
+	getRateLimitResetTimeForModel,
+} from "./runtime/account-status.js";
+import type { AccountMetadataV3 } from "./storage.js";
+import type { TokenFailure } from "./types.js";
+
+type ForecastAvailability = "ready" | "delayed" | "unavailable";
+type ForecastRiskLevel = "low" | "medium" | "high";
+
+export interface ForecastAccountInput {
+	index: number;
+	account: AccountMetadataV3;
+	isCurrent: boolean;
+	now: number;
+	refreshFailure?: TokenFailure;
+	liveQuota?: CodexQuotaSnapshot;
+	quotaCache?: QuotaCacheData | null;
+	allAccounts?: readonly AccountMetadataV3[];
+	runtimeOverlay?: RuntimeForecastOverlay | null;
+	/**
+	 * Prompt family whose per-family rate-limit records gate this forecast.
+	 * Callers with a model in hand resolve it via getModelProfile; the codex
+	 * default preserves the historical behavior for model-less surfaces.
+	 */
+	family?: ModelFamily;
+	/**
+	 * Normalized model the forecast is about, when the caller has one. Selection
+	 * keys token/concurrency limits under `family:<model>`, so without it a
+	 * sibling model's record would be read as gating this one.
+	 */
+	model?: string | null;
+}
+
+export interface RuntimeForecastOverlay {
+	accountSkipReasons?: Record<string, string>;
+	lastPoolExhaustionSkipReasons?: Record<string, string>;
+	policyBlockedIndexes?: number[];
+}
+
+export interface ForecastAccountResult {
+	index: number;
+	label: string;
+	isCurrent: boolean;
+	availability: ForecastAvailability;
+	riskScore: number;
+	riskLevel: ForecastRiskLevel;
+	waitMs: number;
+	reasons: string[];
+	hardFailure: boolean;
+	disabled: boolean;
+	// True when the account is blocked solely by quota-cache exhaustion. Such
+	// accounts are classified `availability === "delayed"` (so display/sorting
+	// still treat them as a timed wait), but they must NOT be recommended as a
+	// "pick shortest wait" fallback when every account is exhausted.
+	exhausted: boolean;
+}
+
+export interface ForecastRecommendation {
+	recommendedIndex: number | null;
+	reason: string;
+}
+
+interface ForecastExplanationAccount {
+	index: number;
+	label: string;
+	isCurrent: boolean;
+	availability: ForecastAvailability;
+	riskScore: number;
+	riskLevel: ForecastRiskLevel;
+	waitMs: number;
+	reasons: string[];
+	selected: boolean;
+}
+
+export interface ForecastExplanation {
+	recommendedIndex: number | null;
+	recommendationReason: string;
+	considered: ForecastExplanationAccount[];
+}
+
+export interface ForecastSummary {
+	total: number;
+	ready: number;
+	delayed: number;
+	unavailable: number;
+	highRisk: number;
+}
+
+function clampRisk(score: number): number {
+	if (!Number.isFinite(score)) return 100;
+	return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+function maskEmail(value: string): string {
+	const atIndex = value.indexOf("@");
+	if (atIndex <= 0) return "***@***";
+	const local = value.slice(0, atIndex);
+	const domain = value.slice(atIndex + 1);
+	const domainParts = domain.split(".");
+	const tld = domainParts.pop() ?? "";
+	const prefix = local.slice(0, Math.min(2, local.length));
+	return `${prefix}***@***.${tld || "***"}`;
+}
+
+function redactEmails(value: string): string {
+	return value.replace(
+		/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g,
+		(match) => maskEmail(match),
+	);
+}
+
+function redactSensitiveReason(value: string): string {
+	return redactEmails(
+		value
+			.replace(/Bearer\s+\S+/gi, "Bearer ***")
+			.replace(/\b(sk-[A-Za-z0-9]{10,})\b/g, "***"),
+	);
+}
+
+function summarizeRefreshFailure(failure: TokenFailure): string {
+	const reasonCode = failure.reason?.trim();
+	if (reasonCode && reasonCode.length > 0) {
+		const statusCode =
+			typeof failure.statusCode === "number" ? ` (${failure.statusCode})` : "";
+		return `${reasonCode}${statusCode}`;
+	}
+	const fallback = failure.message?.trim() || "refresh failed";
+	return redactSensitiveReason(fallback).slice(0, 160);
+}
+
+function getRiskLevel(score: number): ForecastRiskLevel {
+	if (score >= 75) return "high";
+	if (score >= 40) return "medium";
+	return "low";
+}
+
+function getLiveQuotaWaitMs(
+	snapshot: CodexQuotaSnapshot,
+	now: number,
+	onlyExhausted: boolean,
+): number {
+	const waits: number[] = [];
+	for (const window of [snapshot.primary, snapshot.secondary]) {
+		// Under pure usage pressure (not a 429), only an actually-exhausted window
+		// (100% used) should impose a wait. A healthy weekly secondary normally
+		// resets ~7d out; folding that in would overstate the wait by orders of
+		// magnitude and invert the account recommendation (stress audit H5). On a
+		// 429 we honor every future window, since the upstream said "slow down now"
+		// regardless of the usage gauge. The test is the RAW usedPercent, never the
+		// rounded left-percent: 100 - 99.6 rounds to 0 left, which would bench a
+		// window that still has quota and falsely mark the account "delayed".
+		if (onlyExhausted && !quotaUsedPercentIsExhausted(window?.usedPercent)) {
+			continue;
+		}
+		const resetAt = window?.resetAtMs;
+		if (typeof resetAt !== "number") continue;
+		if (!Number.isFinite(resetAt)) continue;
+		const remaining = resetAt - now;
+		if (remaining > 0) waits.push(remaining);
+	}
+	return waits.length > 0 ? Math.max(...waits) : 0;
+}
+
+function describeQuotaUsage(
+	label: string,
+	usedPercent: number | undefined,
+): string | null {
+	if (typeof usedPercent !== "number" || !Number.isFinite(usedPercent))
+		return null;
+	const bounded = Math.max(0, Math.min(100, Math.round(usedPercent)));
+	return `${label} quota ${bounded}% used`;
+}
+
+export function isHardRefreshFailure(failure: TokenFailure): boolean {
+	if (failure.reason === "missing_refresh") return true;
+	if (failure.statusCode === 401) return true;
+	if (failure.statusCode !== 400) return false;
+	const message = (failure.message ?? "").toLowerCase();
+	return (
+		message.includes("invalid_grant") ||
+		message.includes("invalid refresh") ||
+		message.includes("token has been revoked")
+	);
+}
+
+function appendWaitReason(
+	reasons: string[],
+	prefix: string,
+	waitMs: number,
+): void {
+	if (waitMs <= 0) return;
+	reasons.push(`${prefix} ${formatWaitTime(waitMs)}`);
+}
+
+export function evaluateForecastAccount(
+	input: ForecastAccountInput,
+): ForecastAccountResult {
+	const { account, index, isCurrent, now } = input;
+	const reasons: string[] = [];
+	let availability: ForecastAvailability = "ready";
+	let riskScore = isCurrent ? -5 : 0;
+	let waitMs = 0;
+	let hardFailure = false;
+	let exhausted = false;
+	const disabled = account.enabled === false;
+
+	if (disabled) {
+		availability = "unavailable";
+		riskScore += 95;
+		reasons.push("account is disabled");
+	}
+
+	if (
+		typeof account.authInvalidatedAt === "number" &&
+		Number.isFinite(account.authInvalidatedAt)
+	) {
+		availability = "unavailable";
+		riskScore += 95;
+		reasons.push(AUTH_INVALIDATION_MARKER);
+	}
+
+	if (input.refreshFailure) {
+		const hard = isHardRefreshFailure(input.refreshFailure);
+		hardFailure = hard;
+		const detail = summarizeRefreshFailure(input.refreshFailure);
+		if (hard) {
+			availability = "unavailable";
+			riskScore += 90;
+			reasons.push(`hard auth failure: ${detail}`);
+		} else {
+			riskScore += 25;
+			reasons.push(`refresh warning: ${detail}`);
+		}
+	}
+
+	if (
+		typeof account.coolingDownUntil === "number" &&
+		account.coolingDownUntil > now
+	) {
+		const remaining = account.coolingDownUntil - now;
+		waitMs = Math.max(waitMs, remaining);
+		if (availability === "ready") availability = "delayed";
+		riskScore += 45;
+		appendWaitReason(reasons, "cooldown remaining", remaining);
+	}
+
+	// With a model in hand, gate on exactly the keys selection consults for that
+	// family/model pair, and on the LATEST of them: a sibling model's record does
+	// not gate this request, and while both the family-wide and model-scoped keys
+	// are active the account stays skipped until the later one expires.
+	//
+	// Without one (status, fix) no model key can be singled out, so keep the
+	// family-wide union - the conservative answer, and the behavior those
+	// surfaces have always had.
+	const forecastFamily = input.family ?? "codex";
+	const rateLimitResetAt = input.model
+		? getRateLimitResetTimeForModel(account, now, forecastFamily, input.model)
+		: getRateLimitResetTimeForFamily(account, now, forecastFamily);
+	if (typeof rateLimitResetAt === "number") {
+		const remaining = Math.max(0, rateLimitResetAt - now);
+		waitMs = Math.max(waitMs, remaining);
+		if (availability === "ready") availability = "delayed";
+		riskScore += 35;
+		appendWaitReason(reasons, "rate limit resets in", remaining);
+	}
+
+	const quotaEntry = findQuotaCacheEntryForAccount(
+		input.quotaCache,
+		account,
+		input.allAccounts ?? [account],
+	);
+	if (isQuotaCacheEntryExhausted(quotaEntry, now)) {
+		// Only a window that is genuinely at/over 100% used should contribute its
+		// reset time. Testing the ROUNDED left-percent instead would treat a
+		// 99.6%-used sibling as at-limit and fold its (possibly far-future) reset
+		// into the Math.max below, overstating the wait for an account whose
+		// actually-exhausted window recovers much sooner.
+		const resetAts = [quotaEntry?.primary, quotaEntry?.secondary]
+			.filter(
+				(window) =>
+					quotaUsedPercentIsExhausted(window?.usedPercent) &&
+					typeof window?.resetAtMs === "number" &&
+					Number.isFinite(window.resetAtMs) &&
+					window.resetAtMs > now,
+			)
+			.map((window) => window?.resetAtMs ?? 0);
+		const quotaWait = resetAts.length > 0 ? Math.max(...resetAts) - now : waitMs;
+		waitMs = Math.max(waitMs, quotaWait);
+		if (availability === "ready") availability = "delayed";
+		exhausted = true;
+		riskScore += 60;
+		reasons.push("quota cache exhausted");
+		appendWaitReason(reasons, "quota resets in", quotaWait);
+	}
+
+	const overlay = input.runtimeOverlay;
+	const overlayReason =
+		overlay?.accountSkipReasons?.[String(index)] ??
+		overlay?.lastPoolExhaustionSkipReasons?.[String(index)] ??
+		null;
+	// Time-bounded overlay reasons ("rate-limited", "cooling-down:...") are
+	// persisted to runtime-observability.json on pool exhaustion and only ever
+	// cleared by an explicit runtime reset, never on a subsequent successful
+	// request. That leaves a stale reason on disk after the underlying window
+	// expires, so the forecast would keep marking a working account as
+	// unavailable. Cross-reference the time-aware disk state before applying:
+	// drop the overlay reason when the condition it describes is no longer
+	// active. Each reason validates only against its own backing disk state
+	// ("rate-limited" -> rateLimitResetTimes, "cooling-down" -> coolingDownUntil)
+	// so we never substitute a misleading reason string. The rate-limited
+	// cross-check inherits rateLimitResetAt's scope above: a record under one of
+	// the keys that actually gates this family/model request keeps the reason,
+	// while a record for another family - or another model in the same family -
+	// neither sustains it nor gates this request. Non-time-bounded
+	// reasons ("circuit-open", "token-exhausted", "policy-blocked") have no disk
+	// expiry to check and are always applied.
+	const coolingDownActive =
+		typeof account.coolingDownUntil === "number" &&
+		account.coolingDownUntil > now;
+	const isStaleOverlayReason =
+		overlayReason === "rate-limited"
+			? rateLimitResetAt === null
+			: overlayReason?.startsWith("cooling-down")
+				? !coolingDownActive
+				: false;
+	if (overlay?.policyBlockedIndexes?.includes(index)) {
+		availability = "unavailable";
+		riskScore += 95;
+		reasons.push("runtime policy blocked account");
+	} else if (
+		overlayReason &&
+		overlayReason !== "already-attempted" &&
+		!isStaleOverlayReason
+	) {
+		availability = "unavailable";
+		riskScore +=
+			overlayReason === "circuit-open"
+				? 90
+				: overlayReason === "token-exhausted"
+					? 70
+					: 50;
+		reasons.push(`runtime skip: ${overlayReason}`);
+	}
+
+	const quota = input.liveQuota;
+	if (quota) {
+		const primaryUsed = quota.primary.usedPercent ?? 0;
+		const secondaryUsed = quota.secondary.usedPercent ?? 0;
+		const quotaPressure =
+			quota.status === 429 || primaryUsed >= 90 || secondaryUsed >= 90;
+
+		if (quota.status === 429) {
+			availability = availability === "unavailable" ? "unavailable" : "delayed";
+			riskScore += 35;
+			reasons.push("live probe returned 429");
+		}
+		const liveWait = quotaPressure
+			? getLiveQuotaWaitMs(quota, now, quota.status !== 429)
+			: 0;
+		waitMs = Math.max(waitMs, liveWait);
+		if (liveWait > 0 && availability === "ready") {
+			availability = "delayed";
+		}
+
+		// A live window at 100% used with NO resetAtMs has no known recovery time —
+		// the probe reports it fully consumed and cannot say when it refills. On a
+		// 200 probe getLiveQuotaWaitMs then yields 0 (no reset to wait on) and the
+		// 429 branch never fires, so without this the account would stay "ready" and
+		// be recommended as a healthy pick. Treat that case as exhausted and downgrade
+		// a "ready" account to "delayed". A window WITH a resetAtMs is only *delayed*,
+		// not exhausted: getLiveQuotaWaitMs already contributes its wait above, so a
+		// 429 with known reset times stays a recoverable "delayed" account rather than
+		// a blocked one. The raw-usedPercent test (not rounded left-percent) keeps
+		// 99.6% from being falsely benched.
+		const liveExhausted =
+			(quotaUsedPercentIsExhausted(quota.primary.usedPercent) &&
+				typeof quota.primary.resetAtMs !== "number") ||
+			(quotaUsedPercentIsExhausted(quota.secondary.usedPercent) &&
+				typeof quota.secondary.resetAtMs !== "number");
+		if (liveExhausted) {
+			exhausted = true;
+			if (availability === "ready") availability = "delayed";
+		}
+
+		const primaryUsage = describeQuotaUsage(
+			"primary",
+			quota.primary.usedPercent,
+		);
+		if (primaryUsage) reasons.push(primaryUsage);
+		const secondaryUsage = describeQuotaUsage(
+			"secondary",
+			quota.secondary.usedPercent,
+		);
+		if (secondaryUsage) reasons.push(secondaryUsage);
+
+		if (primaryUsed >= 98 || secondaryUsed >= 98) {
+			riskScore += 55;
+		} else if (primaryUsed >= 90 || secondaryUsed >= 90) {
+			riskScore += 35;
+		} else if (primaryUsed >= 80 || secondaryUsed >= 80) {
+			riskScore += 20;
+		} else if (primaryUsed >= 70 || secondaryUsed >= 70) {
+			riskScore += 10;
+		}
+	}
+
+	const hasLastUsed =
+		typeof account.lastUsed === "number" &&
+		Number.isFinite(account.lastUsed) &&
+		account.lastUsed > 0;
+	const lastUsedAge = hasLastUsed ? now - account.lastUsed : null;
+	if (
+		lastUsedAge !== null &&
+		(!Number.isFinite(lastUsedAge) || lastUsedAge < 0)
+	) {
+		riskScore += 5;
+	} else if (lastUsedAge !== null && lastUsedAge > 7 * 24 * 60 * 60 * 1000) {
+		riskScore += 10;
+	}
+
+	const finalRisk = clampRisk(riskScore);
+	return {
+		index,
+		label: redactEmails(formatAccountLabel(account, index)),
+		isCurrent,
+		availability,
+		riskScore: finalRisk,
+		riskLevel: getRiskLevel(finalRisk),
+		waitMs: Math.max(0, Math.floor(waitMs)),
+		reasons,
+		hardFailure,
+		disabled,
+		exhausted,
+	};
+}
+
+export function evaluateForecastAccounts(
+	inputs: ForecastAccountInput[],
+): ForecastAccountResult[] {
+	return inputs.map((input) => evaluateForecastAccount(input));
+}
+
+function compareForecastResults(
+	a: ForecastAccountResult,
+	b: ForecastAccountResult,
+): number {
+	if (a.availability !== b.availability) {
+		const rank: Record<ForecastAvailability, number> = {
+			ready: 0,
+			delayed: 1,
+			unavailable: 2,
+		};
+		return rank[a.availability] - rank[b.availability];
+	}
+
+	if (
+		a.availability === "delayed" &&
+		b.availability === "delayed" &&
+		a.waitMs !== b.waitMs
+	) {
+		return a.waitMs - b.waitMs;
+	}
+
+	if (a.riskScore !== b.riskScore) {
+		return a.riskScore - b.riskScore;
+	}
+
+	if (a.isCurrent !== b.isCurrent) {
+		return a.isCurrent ? -1 : 1;
+	}
+
+	return a.index - b.index;
+}
+
+export function recommendForecastAccount(
+	results: ForecastAccountResult[],
+): ForecastRecommendation {
+	// Exclude unavailable accounts (policy-blocked, runtime-skipped, quota
+	// exhausted) in addition to disabled/hard-failed ones. Such accounts carry
+	// availability === "unavailable" with hardFailure === false, so without this
+	// guard they were recommended with a misleading "pick shortest wait".
+	// Quota-exhausted accounts are classified "delayed" (not "unavailable") to
+	// preserve display/sorting semantics, so exclude them explicitly via the
+	// `exhausted` flag — otherwise an all-exhausted pool returns a bogus
+	// "shortest wait" pick instead of the null recommendation.
+	const candidates = results.filter(
+		(result) =>
+			!result.disabled &&
+			!result.hardFailure &&
+			!result.exhausted &&
+			result.availability !== "unavailable",
+	);
+	if (candidates.length === 0) {
+		// Distinguish "blocked/exhausted" accounts (unavailable but neither
+		// disabled nor hard-failed — e.g. policy block, runtime skip — or
+		// quota-exhausted "delayed" accounts) from disabled/hard-failed ones so
+		// the guidance matches the actual blocker.
+		const hasBlockedOrExhausted = results.some(
+			(result) =>
+				!result.disabled &&
+				!result.hardFailure &&
+				(result.exhausted || result.availability === "unavailable"),
+		);
+		return {
+			recommendedIndex: null,
+			reason: hasBlockedOrExhausted
+				? "All accounts are blocked or exhausted. Wait for a reset, clear the block, or run `codex-multi-auth login` to add a fresh account."
+				: "No healthy accounts are available. Run `codex-multi-auth login` to add a fresh account.",
+		};
+	}
+
+	const sorted = [...candidates].sort(compareForecastResults);
+	const best = sorted[0];
+	if (!best) {
+		return {
+			recommendedIndex: null,
+			reason: "No recommendation available.",
+		};
+	}
+
+	if (best.availability === "ready") {
+		return {
+			recommendedIndex: best.index,
+			reason: `Lowest risk ready account (${best.riskLevel}, score ${best.riskScore}).`,
+		};
+	}
+
+	return {
+		recommendedIndex: best.index,
+		reason: `No account is immediately ready; pick shortest wait (${formatWaitTime(best.waitMs)}).`,
+	};
+}
+
+export function summarizeForecast(
+	results: ForecastAccountResult[],
+): ForecastSummary {
+	return {
+		total: results.length,
+		ready: results.filter((result) => result.availability === "ready").length,
+		delayed: results.filter((result) => result.availability === "delayed")
+			.length,
+		unavailable: results.filter(
+			(result) => result.availability === "unavailable",
+		).length,
+		highRisk: results.filter((result) => result.riskLevel === "high").length,
+	};
+}
+
+export function buildForecastExplanation(
+	results: ForecastAccountResult[],
+	recommendation: ForecastRecommendation,
+): ForecastExplanation {
+	return {
+		recommendedIndex: recommendation.recommendedIndex,
+		recommendationReason: recommendation.reason,
+		considered: results.map((result) => ({
+			index: result.index,
+			label: result.label,
+			isCurrent: result.isCurrent,
+			availability: result.availability,
+			riskScore: result.riskScore,
+			riskLevel: result.riskLevel,
+			waitMs: result.waitMs,
+			reasons: result.reasons,
+			selected: recommendation.recommendedIndex === result.index,
+		})),
+	};
+}

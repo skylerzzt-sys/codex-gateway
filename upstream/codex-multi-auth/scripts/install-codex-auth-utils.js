@@ -1,0 +1,213 @@
+// @ts-check
+
+import { rename as fsRename } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import process from "node:process";
+
+const PLUGIN_NAME = "codex-multi-auth";
+const LEGACY_PLUGIN_NAME = "@ndycode/codex-multi-auth";
+const PLUGIN_NAMES = [PLUGIN_NAME, LEGACY_PLUGIN_NAME];
+
+const TRUE_VALUES = new Set(["1", "true", "yes"]);
+const FALSE_VALUES = new Set(["0", "false", "no"]);
+const CI_ENV_KEYS = [
+	"CI",
+	"GITHUB_ACTIONS",
+	"GITLAB_CI",
+	"CIRCLECI",
+	"BUILDKITE",
+	"TF_BUILD",
+	"TEAMCITY_VERSION",
+	"JENKINS_URL",
+	"TRAVIS",
+	"APPVEYOR",
+	"BITBUCKET_BUILD_NUMBER",
+];
+
+/** @param {string | undefined} value */
+function readOptionalBooleanValue(value) {
+	if (value === undefined || value.trim().length === 0) return null;
+	const normalized = value.trim().toLowerCase();
+	if (TRUE_VALUES.has(normalized)) return true;
+	if (FALSE_VALUES.has(normalized)) return false;
+	return null;
+}
+
+/** @param {NodeJS.ProcessEnv} env @param {string} key */
+function isEnabledEnvFlag(env, key) {
+	const value = env[key];
+	if (value === undefined || value.trim().length === 0) return false;
+	return readOptionalBooleanValue(value) !== false;
+}
+
+/** @param {NodeJS.ProcessEnv} [env] */
+export function isCiEnvironment(env = process.env) {
+	if (readOptionalBooleanValue(env.npm_config_ignore_scripts) === true) return true;
+	return CI_ENV_KEYS.some((key) => isEnabledEnvFlag(env, key));
+}
+export const FILE_RETRY_CODES = new Set([
+	"EBUSY",
+	"EPERM",
+	"EAGAIN",
+	"ENOTEMPTY",
+	"EACCES",
+]);
+export const FILE_RETRY_MAX_ATTEMPTS = 6;
+export const FILE_RETRY_BASE_DELAY_MS = 25;
+export const FILE_RETRY_JITTER_MS = 20;
+
+/**
+ * @param {NodeJS.Platform} [platform]
+ * @param {NodeJS.ProcessEnv} [env]
+ * @param {string} [home]
+ */
+export function resolveInstallPaths(
+	platform = process.platform,
+	env = process.env,
+	home = homedir(),
+) {
+	const isWindows = platform === "win32";
+	const appData = (env.APPDATA ?? "").trim();
+	const localAppData = (env.LOCALAPPDATA ?? appData).trim();
+	const configBase = isWindows
+		? appData || join(home, "AppData", "Roaming")
+		: join(home, ".config");
+	const cacheBase = isWindows
+		? localAppData || join(home, "AppData", "Local")
+		: join(home, ".cache");
+	const configDir = join(configBase, "Codex");
+	const configPath = join(configDir, "Codex.json");
+	const cacheDir = join(cacheBase, "Codex");
+	return {
+		configDir,
+		configPath,
+		cacheDir,
+		cacheNodeModules: join(cacheDir, "node_modules", PLUGIN_NAME),
+		cacheLegacyNodeModules: join(cacheDir, "node_modules", "@ndycode", "codex-multi-auth"),
+		cacheBunLock: join(cacheDir, "bun.lock"),
+		cachePackageJson: join(cacheDir, "package.json"),
+	};
+}
+
+/** @param {unknown} list */
+export function removePluginFromList(list) {
+	const entries = Array.isArray(list) ? list.filter(Boolean) : [];
+	return entries.filter((entry) => {
+		if (typeof entry !== "string") return true;
+		return !PLUGIN_NAMES.some(
+			(pluginName) => entry === pluginName || entry.startsWith(`${pluginName}@`),
+		);
+	});
+}
+
+/** @param {unknown} list */
+export function normalizePluginList(list) {
+	const entries = Array.isArray(list) ? list.filter(Boolean) : [];
+	const filtered = entries.filter((entry) => {
+		if (typeof entry !== "string") return true;
+		return !PLUGIN_NAMES.some(
+			(pluginName) => entry === pluginName || entry.startsWith(`${pluginName}@`),
+		);
+	});
+	const deduped = [];
+	const seen = new Set();
+	for (const entry of filtered) {
+		const key =
+			typeof entry === "string" ? `s:${entry}` : `j:${JSON.stringify(entry)}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		deduped.push(entry);
+	}
+	return [...deduped, PLUGIN_NAME];
+}
+
+/** @param {number} ms */
+function sleep(ms) {
+	// Keep this helper local so installer scripts remain standalone and do not depend on lib/.
+	return new Promise((resolve) => {
+		setTimeout(resolve, ms);
+	});
+}
+
+/** @param {unknown} error */
+function shouldRetryFileOperation(error) {
+	const fileError = /** @type {NodeJS.ErrnoException | undefined} */ (error);
+	return (
+		fileError instanceof Error &&
+		typeof fileError.code === "string" &&
+		FILE_RETRY_CODES.has(fileError.code)
+	);
+}
+
+/** @template T @param {() => Promise<T>} operation */
+export async function withFileOperationRetry(operation) {
+	for (let attempt = 1; ; attempt += 1) {
+		try {
+			return await operation();
+		} catch (error) {
+			if (
+				!shouldRetryFileOperation(error) ||
+				attempt >= FILE_RETRY_MAX_ATTEMPTS
+			) {
+				throw error;
+			}
+
+			const jitter = Math.floor(Math.random() * FILE_RETRY_JITTER_MS);
+			const delayMs = FILE_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1) + jitter;
+			await sleep(delayMs);
+		}
+	}
+}
+
+/**
+ * @param {string} sourcePath
+ * @param {string} targetPath
+ * @param {{
+ *   rename?: (sourcePath: string, targetPath: string) => Promise<void>,
+ *   log?: (message: string) => void,
+ *   maxRetries?: number,
+ *   baseDelayMs?: number,
+ *   jitterMs?: number,
+ *   random?: () => number,
+ *   sleep?: (ms: number) => Promise<void>,
+ * }} [options]
+ */
+export async function renameWithRetry(sourcePath, targetPath, options = {}) {
+	const {
+		rename = fsRename,
+		log = () => {},
+		maxRetries = FILE_RETRY_MAX_ATTEMPTS,
+		baseDelayMs = FILE_RETRY_BASE_DELAY_MS,
+		jitterMs = FILE_RETRY_JITTER_MS,
+		random = Math.random,
+		sleep: sleepImpl = sleep,
+	} = options;
+
+	if (!Number.isInteger(maxRetries) || maxRetries < 1) {
+		throw new RangeError("maxRetries must be an integer >= 1");
+	}
+
+	for (let attempt = 0; attempt < maxRetries; attempt += 1) {
+		try {
+			await rename(sourcePath, targetPath);
+			return;
+		} catch (error) {
+			const code =
+				error && typeof error === "object" && "code" in error
+					? error.code
+					: undefined;
+			const isRetryable =
+				typeof code === "string" && FILE_RETRY_CODES.has(code);
+			if (!isRetryable || attempt === maxRetries - 1) {
+				throw error;
+			}
+			const delayMs =
+				baseDelayMs * 2 ** attempt + Math.floor(random() * jitterMs);
+			log(
+				`Retrying atomic rename (${attempt + 1}/${maxRetries}) code=${code ?? "unknown"} source=${sourcePath} target=${targetPath} delayMs=${delayMs}`,
+			);
+			await sleepImpl(delayMs);
+		}
+	}
+}

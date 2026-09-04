@@ -1,0 +1,171 @@
+# Public API Contract
+
+Public API contract for `codex-multi-auth` (package `2.8.6`).
+
+---
+
+## Stability Tiers
+
+This project uses tiered API stability.
+
+### Tier A: Stable APIs
+
+Stable APIs are covered by semver compatibility guarantees and must remain backward-compatible inside the current `2.x` line unless explicitly documented.
+
+- Package root plugin entrypoint exports:
+  - `OpenAIOAuthPlugin`
+  - `OpenAIAuthPlugin`
+  - default export (alias of `OpenAIOAuthPlugin`)
+- Installed binaries (published Tier A CLI surface):
+  - `codex-multi-auth` — primary account-manager CLI
+  - `codex-multi-auth-codex` — official Codex forwarding wrapper
+  - `codex-multi-auth-app-launcher` — packaged-app launcher routing helper
+  - `mcodex` — convenience launcher over the codex wrapper (`--monitor`, `--tmux`, or default forward)
+- Supported package subpath entrypoints:
+  - `codex-multi-auth/auth`
+  - `codex-multi-auth/storage`
+  - `codex-multi-auth/config`
+  - `codex-multi-auth/request`
+  - `codex-multi-auth/cli`
+- CLI surface:
+  - `codex-multi-auth ...` command family
+  - documented flags and aliases in `reference/commands.md`
+  - default-on `codex-multi-auth rotation ...` command family for runtime Responses proxy and app bind management
+  - `mcodex` convenience modes documented in `reference/commands.md`
+- Persistent user-facing config and storage contracts documented in:
+  - `reference/settings.md`
+  - `reference/storage-paths.md`
+
+### Tier B: Compatibility APIs
+
+Compatibility APIs are exported for ecosystem continuity but are not treated as first-class product entrypoints.
+
+- Deep module exports from `dist/lib/index.js` and `lib/index.ts` barrel re-exports.
+- Existing positional signatures remain supported.
+- New options-object alternatives are preferred for new callers.
+
+Compatibility policy for Tier B:
+
+- Additive changes are allowed.
+- Existing exported symbols must not be removed in this release line.
+- Deprecated usage may be documented, but hard removals require a major version transition plan.
+
+### Tier C: Internal APIs
+
+Internal APIs are any non-exported internals and implementation details not covered by Tier A or Tier B.
+
+- No compatibility guarantee.
+- May change at any time if Tier A/Tier B behavior remains intact.
+
+---
+
+## Preferred Calling Style
+
+For exported functions with many positional parameters, use options-object forms when available.
+
+Examples of additive options-object alternatives:
+
+- `selectHybridAccount({ ... })`
+- `exponentialBackoff({ ... })`
+- `getTopCandidates({ ... })`
+- `createCodexHeaders({ ... })`
+- `getRateLimitBackoffWithReason({ ... })`
+- `transformRequestBody({ ... })`
+
+Positional signatures are preserved for backward compatibility.
+
+---
+
+## Responses Contract Notes
+
+The request-transform layer intentionally preserves and/or normalizes modern Responses API fields that callers may already send through the host SDK.
+
+- The plugin preserves `previous_response_id` when explicitly provided and may auto-fill it from plugin continuation state when `pluginConfig.responseContinuation` is enabled, maintains `text.format` when verbosity defaults are applied, and honors `prompt_cache_retention` from the request body before falling back to `providerOptions.openai.promptCacheRetention` or user config defaults.
+- `background` is typed as a first-class request field. It remains disabled by default and only passes through when `pluginConfig.backgroundResponses` or `CODEX_AUTH_BACKGROUND_RESPONSES=1` explicitly enables the stateful compatibility path.
+- Background-mode requests force `store=true`, keep caller-supplied input item IDs, and skip stateless-only defaults such as `reasoning.encrypted_content` injection and fast-session trimming.
+- Upgrade note: leave background mode disabled for existing stateless pipelines. Enable it only for callers that intentionally send `background: true` and are ready for stateful `store=true` routing. For rollout steps, see [../upgrade.md](../upgrade.md).
+- Hosted built-in tool definitions are typed and supported for:
+  - `tool_search`
+  - remote `mcp`
+  - `computer` / `computer_use_preview`
+  - `namespace` bundles containing nested tools
+- Unsupported hosted search/computer tools are filtered before the upstream request when the selected model profile does not advertise that capability.
+- Semantic SSE parsing synthesizes compatibility fields such as:
+  - `output_text`
+  - `reasoning_summary_text`
+  - `commentary_text`
+  - `final_answer_text`
+  - `phase_text`
+
+These SSE compatibility fields are synthesized only when the corresponding content is present in the response stream.
+
+These behaviors are compatibility guarantees for the current release line because they protect caller intent while keeping the plugin stateless against the ChatGPT Codex backend.
+
+---
+
+## Runtime Rotation Contract Notes
+
+Runtime rotation is a CLI/runtime feature, not a library transport API.
+
+- It is enabled by default for request-bearing wrapper-launched Codex sessions.
+- `codex-multi-auth rotation enable` persists `pluginConfig.codexRuntimeRotationProxy=true`.
+- `codex-multi-auth rotation disable` persists `pluginConfig.codexRuntimeRotationProxy=false`.
+- `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=0` disables the proxy for the current process without changing settings.
+- The local provider id is `codex-multi-auth-runtime-proxy`.
+- The proxy accepts only authenticated loopback requests for Responses API, model discovery, and thread-goal paths.
+- Account policy `pause` / `drain` (via `codex-multi-auth account ...`) is enforced by `evaluateRuntimePolicy` and blocks those accounts from hybrid selection.
+- The packaged app bind is reversible and must not patch official app binaries.
+- Client responses must not expose account emails, tokens, private account headers, hop-by-hop headers, or stale decoded `content-encoding`.
+
+These details are documented for operator expectations. Internal helper process arguments, shadow-home lock filenames, router status file shape, and retry timing are implementation details unless they are explicitly documented in `reference/commands.md` or `reference/storage-paths.md`.
+
+---
+
+## Local Bridge Contract Notes
+
+`startLocalBridge` (package root / public barrel) is the host API that opens the
+optional loopback bridge. There is no `bridge start` CLI daemon.
+
+- Bind host must be loopback; `runtimeBaseUrl` must also be loopback (the runtime rotation proxy).
+- Default `requireAuth=true`. Configuring `runtimeClientApiKey` **requires** `requireAuth=true`.
+- Surfaces: `/health`, `/v1/models`, `/v1/responses` only.
+- Client tokens are managed with `codex-multi-auth bridge token ...` (hashes on disk).
+- Client snippets: `codex-multi-auth integrations ...`.
+
+See [commands.md](commands.md#starting-the-local-bridge-hostapi) for the operator checklist.
+
+---
+
+## Semver Guidance
+
+- Breaking Tier A change: `MAJOR`
+- Additive Tier A change: `MINOR`
+- Tier A bug fix or doc-only clarification: `PATCH`
+- Tier B additive compatibility improvement: usually `PATCH` or `MINOR` depending on caller impact
+
+This repository currently ships on a `2.x` line, and breaking changes still require explicit migration documentation and review sign-off.
+
+---
+
+## Migration Rules
+
+For any future intentional contract break:
+
+1. Identify affected callers and command workflows.
+2. Provide migration path with concrete before/after examples.
+3. Update:
+   - `README.md`
+   - `docs/upgrade.md`
+   - affected `docs/reference/*`
+   - release notes and changelog
+4. Add tests proving both old and new behavior during transition windows when feasible.
+
+---
+
+## Related
+
+- [commands.md](commands.md)
+- [error-contracts.md](error-contracts.md)
+- [settings.md](settings.md)
+- [storage-paths.md](storage-paths.md)
+- [../upgrade.md](../upgrade.md)

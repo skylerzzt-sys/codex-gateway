@@ -1,0 +1,239 @@
+import {
+	getRuntimeTrackerKey,
+	type ManagedAccount,
+	type AccountManager,
+} from "./accounts.js";
+import type { ModelFamily } from "./prompts/codex.js";
+import { createLogger } from "./logger.js";
+import {
+	getHealthTracker,
+	getTokenTracker,
+	type AccountWithMetrics,
+} from "./rotation.js";
+import { clearExpiredRateLimits, isRateLimitedForFamily } from "./accounts/rate-limits.js";
+
+const log = createLogger("parallel-probe");
+
+export interface ProbeCandidate {
+	account: ManagedAccount;
+	controller: AbortController;
+}
+
+export interface ProbeResult<T> {
+	type: "success" | "failure";
+	account: ManagedAccount;
+	response?: T;
+	error?: Error;
+}
+
+export interface ParallelProbeOptions {
+	maxConcurrency: number;
+	timeoutMs: number;
+}
+
+export interface GetTopCandidatesParams {
+	accountManager: AccountManager;
+	modelFamily: ModelFamily;
+	model: string | null;
+	maxCandidates: number;
+}
+
+function isAccountManager(value: unknown): value is AccountManager {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"getAccountsSnapshot" in value &&
+		typeof value.getAccountsSnapshot === "function"
+	);
+}
+
+function isGetTopCandidatesParams(value: unknown): value is GetTopCandidatesParams {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"accountManager" in value &&
+		isAccountManager(value.accountManager) &&
+		"modelFamily" in value &&
+		typeof value.modelFamily === "string" &&
+		"model" in value &&
+		(typeof value.model === "string" || value.model === null) &&
+		"maxCandidates" in value &&
+		typeof value.maxCandidates === "number"
+	);
+}
+
+function toProbeError(error: unknown): Error {
+	return error instanceof Error ? error : new Error(String(error));
+}
+
+/**
+ * Get top N candidates ranked by hybrid score WITHOUT mutating AccountManager state.
+ * Uses getAccountsSnapshot() and ranks by health + tokens + freshness.
+ */
+export function getTopCandidates(
+	params: GetTopCandidatesParams,
+): ManagedAccount[];
+export function getTopCandidates(
+	accountManager: AccountManager,
+	modelFamily: ModelFamily,
+	model: string | null,
+	maxCandidates: number,
+): ManagedAccount[];
+export function getTopCandidates(
+	accountManagerOrParams: AccountManager | GetTopCandidatesParams,
+	modelFamily?: ModelFamily,
+	model?: string | null,
+	maxCandidates?: number,
+): ManagedAccount[] {
+	const useNamedParams = typeof modelFamily === "undefined";
+	let resolvedAccountManager: AccountManager;
+	let resolvedModelFamily: ModelFamily | undefined;
+	let resolvedModel: string | null | undefined;
+	let resolvedMaxCandidates: number | undefined;
+
+	if (useNamedParams) {
+		if (!isGetTopCandidatesParams(accountManagerOrParams)) {
+			throw new TypeError("getTopCandidates requires accountManager");
+		}
+		const namedParams = accountManagerOrParams;
+		resolvedAccountManager = namedParams.accountManager;
+		resolvedModelFamily = namedParams.modelFamily;
+		resolvedModel = namedParams.model;
+		resolvedMaxCandidates = namedParams.maxCandidates;
+	} else {
+		if (!isAccountManager(accountManagerOrParams)) {
+			throw new TypeError("getTopCandidates requires accountManager");
+		}
+		resolvedAccountManager = accountManagerOrParams;
+		resolvedModelFamily = modelFamily;
+		resolvedModel = model;
+		resolvedMaxCandidates = maxCandidates;
+	}
+
+	if (
+		!resolvedAccountManager ||
+		typeof resolvedAccountManager.getAccountsSnapshot !== "function"
+	) {
+		throw new TypeError("getTopCandidates requires accountManager");
+	}
+	if (!resolvedModelFamily) {
+		throw new TypeError("getTopCandidates requires modelFamily");
+	}
+	if (
+		typeof resolvedMaxCandidates !== "number" ||
+		!Number.isInteger(resolvedMaxCandidates) ||
+		resolvedMaxCandidates <= 0
+	) {
+		throw new TypeError("getTopCandidates requires maxCandidates to be a positive integer");
+	}
+	const normalizedModelFamily = resolvedModelFamily;
+	const normalizedMaxCandidates = resolvedMaxCandidates;
+
+	const accounts = resolvedAccountManager.getAccountsSnapshot();
+	if (accounts.length === 0) return [];
+
+	const quotaKey = resolvedModel ? `${normalizedModelFamily}:${resolvedModel}` : normalizedModelFamily;
+	const healthTracker = getHealthTracker();
+	const tokenTracker = getTokenTracker();
+
+	const accountsWithMetrics: (AccountWithMetrics & { account: ManagedAccount })[] = [];
+
+	for (const account of accounts) {
+		clearExpiredRateLimits(account);
+		const isRateLimited = isRateLimitedForFamily(account, normalizedModelFamily, resolvedModel);
+		const isCoolingDown = account.coolingDownUntil !== undefined && account.coolingDownUntil > Date.now();
+		const isAuthInvalidated =
+			typeof account.authInvalidatedAt === "number" &&
+			Number.isFinite(account.authInvalidatedAt);
+		const isAvailable =
+			!isRateLimited && !isCoolingDown && !isAuthInvalidated;
+
+		accountsWithMetrics.push({
+			index: account.index,
+			trackerKey: getRuntimeTrackerKey(account),
+			isAvailable,
+			lastUsed: account.lastUsed,
+			account,
+		});
+	}
+
+	const available = accountsWithMetrics.filter((a) => a.isAvailable);
+	if (available.length === 0) return [];
+
+	const now = Date.now();
+	const scored = available.map((a) => {
+		const trackerKey = a.trackerKey ?? a.index;
+		const health = healthTracker.getScore(trackerKey, quotaKey);
+		const tokens = tokenTracker.getTokens(trackerKey, quotaKey);
+		const hoursSinceUsed = (now - a.lastUsed) / (1000 * 60 * 60);
+		const score = health * 2 + tokens * 5 + hoursSinceUsed * 2.0;
+		return { ...a, score };
+	});
+
+	scored.sort((a, b) => b.score - a.score);
+
+	return scored.slice(0, normalizedMaxCandidates).map((s) => s.account);
+}
+
+/**
+ * Probe accounts in parallel with first-success-wins racing.
+ * Immediately aborts losing candidates when a winner is found.
+ */
+export async function probeAccountsInParallel<T>(
+	candidates: ProbeCandidate[],
+	probeFn: (account: ManagedAccount, signal: AbortSignal) => Promise<T>,
+	_options: Partial<ParallelProbeOptions> = {},
+): Promise<ProbeResult<T> | null> {
+	if (candidates.length === 0) {
+		return null;
+	}
+
+	if (candidates.length === 1) {
+		const candidate = candidates[0];
+		if (!candidate) return null;
+		const { account, controller } = candidate;
+		try {
+			const response = await probeFn(account, controller.signal);
+			return { type: "success", account, response };
+		} catch (error) {
+			return { type: "failure", account, error: toProbeError(error) };
+		}
+	}
+
+	log.debug(`Probing ${candidates.length} accounts in parallel`);
+
+	let winner: ProbeResult<T> | null = null;
+	let resolvedCount = 0;
+
+	return new Promise<ProbeResult<T> | null>((resolve) => {
+		for (const { account, controller } of candidates) {
+			probeFn(account, controller.signal)
+				.then((response) => {
+					if (!winner) {
+						winner = { type: "success", account, response };
+						log.debug(`Parallel probe succeeded with account ${account.index + 1}`);
+
+						for (const c of candidates) {
+							if (c.account.index !== account.index) {
+								c.controller.abort();
+							}
+						}
+						resolve(winner);
+					}
+				})
+				.catch((_error) => {
+					resolvedCount++;
+					if (resolvedCount === candidates.length && !winner) {
+						resolve(null);
+					}
+				});
+		}
+	});
+}
+
+export function createProbeCandidates(accounts: ManagedAccount[]): ProbeCandidate[] {
+	return accounts.map((account) => ({
+		account,
+		controller: new AbortController(),
+	}));
+}

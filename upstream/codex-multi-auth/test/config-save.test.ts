@@ -1,0 +1,810 @@
+import { promises as fs } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const RETRYABLE_REMOVE_CODES = new Set(["EBUSY", "EPERM", "ENOTEMPTY"]);
+
+async function removeWithRetry(
+  targetPath: string,
+  options: { recursive?: boolean; force?: boolean },
+): Promise<void> {
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    try {
+      await fs.rm(targetPath, options);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return;
+      if (!code || !RETRYABLE_REMOVE_CODES.has(code) || attempt === 5) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25 * 2 ** attempt));
+    }
+  }
+}
+
+describe("plugin config save paths", () => {
+  let tempDir = "";
+  const envKeys = [
+    "CODEX_MULTI_AUTH_DIR",
+    "CODEX_MULTI_AUTH_CONFIG_PATH",
+    "CODEX_HOME",
+    "CODEX_AUTH_PARALLEL_PROBING",
+    "CODEX_AUTH_PARALLEL_PROBING_MAX_CONCURRENCY",
+  ] as const;
+  const previousEnv: Partial<
+    Record<(typeof envKeys)[number], string | undefined>
+  > = {};
+
+  beforeEach(async () => {
+    for (const key of envKeys) {
+      previousEnv[key] = process.env[key];
+    }
+    tempDir = await fs.mkdtemp(join(tmpdir(), "codex-config-save-"));
+    process.env.CODEX_MULTI_AUTH_DIR = tempDir;
+    vi.resetModules();
+  });
+
+  afterEach(async () => {
+    for (const key of envKeys) {
+      const previous = previousEnv[key];
+      if (previous === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = previous;
+      }
+    }
+    vi.restoreAllMocks();
+    vi.resetModules();
+    if (tempDir) {
+      await removeWithRetry(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("merges and sanitizes env-path saves", async () => {
+    const configPath = join(tempDir, "plugin-config.json");
+    process.env.CODEX_MULTI_AUTH_CONFIG_PATH = configPath;
+    await fs.writeFile(
+      configPath,
+      JSON.stringify({ codexMode: true, preserved: 1 }),
+      "utf8",
+    );
+
+    const { savePluginConfig } = await import("../lib/config.js");
+    await savePluginConfig({
+      codexTuiV2: false,
+      retryAllAccountsMaxRetries: Number.POSITIVE_INFINITY,
+      unsupportedCodexFallbackChain: { "gpt-5": ["gpt-4o"] },
+      parallelProbing: undefined,
+    });
+
+    const parsed = JSON.parse(await fs.readFile(configPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(parsed.codexMode).toBe(true);
+    expect(parsed.preserved).toBe(1);
+    expect(parsed.codexTuiV2).toBe(false);
+    expect(parsed.retryAllAccountsMaxRetries).toBeUndefined();
+    expect(parsed.parallelProbing).toBeUndefined();
+    expect(parsed.unsupportedCodexFallbackChain).toEqual({
+      "gpt-5": ["gpt-4o"],
+    });
+  });
+
+  it("recovers from malformed env-path JSON before saving", async () => {
+    const configPath = join(tempDir, "plugin-config.json");
+    process.env.CODEX_MULTI_AUTH_CONFIG_PATH = configPath;
+    await fs.writeFile(configPath, "{ malformed", "utf8");
+
+    const { savePluginConfig } = await import("../lib/config.js");
+    await savePluginConfig({ codexMode: false, fastSession: true });
+
+    const parsed = JSON.parse(await fs.readFile(configPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(parsed.codexMode).toBe(false);
+    expect(parsed.fastSession).toBe(true);
+  });
+
+  it("cleans temp files when env-path rename target is invalid", async () => {
+    const invalidTarget = join(tempDir, "config-target-dir");
+    process.env.CODEX_MULTI_AUTH_CONFIG_PATH = invalidTarget;
+    await fs.mkdir(invalidTarget, { recursive: true });
+
+    const { savePluginConfig } = await import("../lib/config.js");
+    await expect(savePluginConfig({ codexMode: false })).rejects.toBeTruthy();
+
+    const entries = await fs.readdir(tempDir);
+    const leakedTemps = entries.filter(
+      (name) => name.startsWith("config-target-dir.") && name.endsWith(".tmp"),
+    );
+    expect(leakedTemps).toHaveLength(0);
+  });
+
+  it("does not lose a concurrent env-path update (mtime compare-and-swap)", async () => {
+    const configPath = join(tempDir, "plugin-config.json");
+    process.env.CODEX_MULTI_AUTH_CONFIG_PATH = configPath;
+    await fs.writeFile(
+      configPath,
+      JSON.stringify({ codexMode: true, preserved: 1 }),
+      "utf8",
+    );
+    // Pin a known starting mtime so the simulated concurrent write below
+    // produces a clearly different timestamp.
+    const baseTime = new Date("2026-01-01T00:00:00.000Z");
+    await fs.utimes(configPath, baseTime, baseTime);
+
+    const originalReadFile = fs.readFile.bind(fs);
+    let injectedConcurrentWrite = false;
+    const readSpy = vi
+      .spyOn(fs, "readFile")
+      .mockImplementation(async (...args) => {
+        const result = await originalReadFile(
+          ...(args as Parameters<typeof fs.readFile>),
+        );
+        if (
+          String(args[0]) === configPath &&
+          !injectedConcurrentWrite
+        ) {
+          // Simulate another process landing a write AFTER our read but
+          // BEFORE our rename. The CAS must detect the mtime change, abort
+          // with ESTALE, then re-read and merge so this key is not lost.
+          injectedConcurrentWrite = true;
+          const concurrentTime = new Date("2026-01-02T00:00:00.000Z");
+          await fs.writeFile(
+            configPath,
+            JSON.stringify({
+              codexMode: true,
+              preserved: 1,
+              concurrentKey: "from-other-process",
+            }),
+            "utf8",
+          );
+          await fs.utimes(configPath, concurrentTime, concurrentTime);
+        }
+        return result;
+      });
+
+    try {
+      const { savePluginConfig } = await import("../lib/config.js");
+      await savePluginConfig({ fastSession: true });
+    } finally {
+      readSpy.mockRestore();
+    }
+
+    const parsed = JSON.parse(await fs.readFile(configPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    // The concurrent process's key survives (not clobbered) and our patch applies.
+    expect(parsed.concurrentKey).toBe("from-other-process");
+    expect(parsed.fastSession).toBe(true);
+    expect(parsed.codexMode).toBe(true);
+    expect(parsed.preserved).toBe(1);
+  });
+
+  it("retries a transient stat failure during an env-path save (config-08)", async () => {
+    const configPath = join(tempDir, "plugin-config.json");
+    process.env.CODEX_MULTI_AUTH_CONFIG_PATH = configPath;
+    await fs.writeFile(
+      configPath,
+      JSON.stringify({ codexMode: true, preserved: 1 }),
+      "utf8",
+    );
+
+    const originalStat = fs.stat.bind(fs);
+    let injectedStatFailure = false;
+    const statSpy = vi.spyOn(fs, "stat").mockImplementation(async (...args) => {
+      // One-shot EBUSY on the first mtime probe of the config file. Without the
+      // bounded retry in getConfigFileMtimeMs, this transient Windows lock would
+      // abort the whole save.
+      if (String(args[0]) === configPath && !injectedStatFailure) {
+        injectedStatFailure = true;
+        const error = new Error("busy") as NodeJS.ErrnoException;
+        error.code = "EBUSY";
+        throw error;
+      }
+      return originalStat(...(args as Parameters<typeof fs.stat>));
+    });
+
+    try {
+      const { savePluginConfig } = await import("../lib/config.js");
+      await savePluginConfig({ fastSession: true });
+    } finally {
+      statSpy.mockRestore();
+    }
+
+    expect(injectedStatFailure).toBe(true);
+    const parsed = JSON.parse(await fs.readFile(configPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(parsed.fastSession).toBe(true);
+    expect(parsed.codexMode).toBe(true);
+    expect(parsed.preserved).toBe(1);
+  });
+
+  it("does not lose a concurrent env-path update injected at rename time (config-09)", async () => {
+    const configPath = join(tempDir, "plugin-config.json");
+    process.env.CODEX_MULTI_AUTH_CONFIG_PATH = configPath;
+    await fs.writeFile(
+      configPath,
+      JSON.stringify({ codexMode: true, preserved: 1 }),
+      "utf8",
+    );
+    // Pin a known starting mtime so the simulated concurrent write produces a
+    // clearly different timestamp.
+    const baseTime = new Date("2026-01-01T00:00:00.000Z");
+    await fs.utimes(configPath, baseTime, baseTime);
+
+    const originalRename = fs.rename.bind(fs);
+    let injectedConcurrentWrite = false;
+    const renameSpy = vi
+      .spyOn(fs, "rename")
+      .mockImplementation(async (...args) => {
+        const dest = String(args[1]);
+        // Simulate another process landing a write at the very last moment:
+        // AFTER our mtime CAS passed but BEFORE our rename commits — the window
+        // the existing readFile-injection test cannot reach. The atomic writer
+        // surfaces ESTALE; the second-line CAS loop must re-read and re-merge so
+        // the competing key is not clobbered.
+        if (dest === configPath && !injectedConcurrentWrite) {
+          injectedConcurrentWrite = true;
+          const concurrentTime = new Date("2026-01-02T00:00:00.000Z");
+          await fs.writeFile(
+            configPath,
+            JSON.stringify({
+              codexMode: true,
+              preserved: 1,
+              concurrentKey: "from-other-process",
+            }),
+            "utf8",
+          );
+          await fs.utimes(configPath, concurrentTime, concurrentTime);
+          const staleError = new Error(
+            "config changed during rename",
+          ) as NodeJS.ErrnoException;
+          staleError.code = "ESTALE";
+          throw staleError;
+        }
+        return originalRename(...(args as Parameters<typeof fs.rename>));
+      });
+
+    try {
+      const { savePluginConfig } = await import("../lib/config.js");
+      await savePluginConfig({ fastSession: true });
+    } finally {
+      renameSpy.mockRestore();
+    }
+
+    expect(injectedConcurrentWrite).toBe(true);
+    const parsed = JSON.parse(await fs.readFile(configPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    // The last-moment competing key survives and our patch still applies.
+    expect(parsed.concurrentKey).toBe("from-other-process");
+    expect(parsed.fastSession).toBe(true);
+    expect(parsed.codexMode).toBe(true);
+    expect(parsed.preserved).toBe(1);
+  });
+
+  it("takes over a stale foreign lock and removes only its own lock (config-18)", async () => {
+    const configPath = join(tempDir, "plugin-config.json");
+    process.env.CODEX_MULTI_AUTH_CONFIG_PATH = configPath;
+    await fs.writeFile(configPath, JSON.stringify({ preserved: 1 }), "utf8");
+
+    // Seed a STALE foreign-owned lock (different owner, already expired). Our
+    // save must take it over, complete, and clean up.
+    const lockPath = `${configPath}.lock`;
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        pid: 999999,
+        owner: "other-owner-token",
+        acquiredAt: Date.now() - 60_000,
+        expiresAt: Date.now() - 30_000,
+      })}\n`,
+      "utf8",
+    );
+
+    const { savePluginConfig } = await import("../lib/config.js");
+    await savePluginConfig({ fastSession: true });
+
+    const parsed = JSON.parse(await fs.readFile(configPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(parsed.fastSession).toBe(true);
+    expect(parsed.preserved).toBe(1);
+    // Our own lock is released after the save.
+    await expect(fs.access(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not delete a live foreign lock and times out instead (config-18)", async () => {
+    const configPath = join(tempDir, "plugin-config.json");
+    process.env.CODEX_MULTI_AUTH_CONFIG_PATH = configPath;
+    await fs.writeFile(configPath, JSON.stringify({ preserved: 1 }), "utf8");
+
+    // Seed a LIVE foreign-owned lock (different owner, not expired). Our save
+    // must respect it (wait then time out) and must NOT delete the other
+    // owner's lockfile.
+    const lockPath = `${configPath}.lock`;
+    const foreignPayload = `${JSON.stringify({
+      pid: 999999,
+      owner: "other-owner-token",
+      acquiredAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+    })}\n`;
+    await fs.writeFile(lockPath, foreignPayload, "utf8");
+
+    const { savePluginConfig } = await import("../lib/config.js");
+    await expect(savePluginConfig({ fastSession: true })).rejects.toMatchObject({
+      code: "ELOCKTIMEOUT",
+    });
+
+    // The foreign lock is untouched (same owner token, not stomped).
+    const lockAfter = JSON.parse(await fs.readFile(lockPath, "utf8")) as {
+      owner?: string;
+    };
+    expect(lockAfter.owner).toBe("other-owner-token");
+    // And our save did not partially apply.
+    const parsed = JSON.parse(await fs.readFile(configPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(parsed.fastSession).toBeUndefined();
+    await fs.rm(lockPath, { force: true });
+  }, 15_000);
+
+  it("writes through unified settings when env path is unset", async () => {
+    delete process.env.CODEX_MULTI_AUTH_CONFIG_PATH;
+    const unifiedPath = join(tempDir, "settings.json");
+    await fs.writeFile(
+      unifiedPath,
+      JSON.stringify({
+        version: 1,
+        pluginConfig: {
+          preserved: 1,
+          codexMode: true,
+        },
+      }),
+      "utf8",
+    );
+
+    const logWarnMock = vi.fn();
+    vi.doMock("../lib/logger.js", async () => {
+      const actual =
+        await vi.importActual<typeof import("../lib/logger.js")>(
+          "../lib/logger.js",
+        );
+      return {
+        ...actual,
+        logWarn: logWarnMock,
+      };
+    });
+
+    try {
+      const { savePluginConfig, loadPluginConfig } =
+        await import("../lib/config.js");
+      await savePluginConfig({
+        codexMode: false,
+        parallelProbing: true,
+        parallelProbingMaxConcurrency: 7,
+      });
+
+			const loaded = loadPluginConfig();
+			expect(loaded.codexMode).toBe(false);
+			expect(loaded.parallelProbing).toBe(true);
+			expect(loaded.parallelProbingMaxConcurrency).toBe(2);
+
+      const parsed = JSON.parse(await fs.readFile(unifiedPath, "utf8")) as {
+        pluginConfig?: Record<string, unknown>;
+      };
+      expect(parsed.pluginConfig).toEqual({
+        preserved: 1,
+        codexMode: false,
+        parallelProbing: true,
+      });
+      expect(logWarnMock).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "Ignoring invalid plugin config field(s): parallelProbingMaxConcurrency.",
+        ),
+      );
+    } finally {
+      vi.doUnmock("../lib/logger.js");
+    }
+	});
+
+  it("does not overwrite an unreadable env-path config file", async () => {
+    const configPath = join(tempDir, "plugin-config.json");
+    process.env.CODEX_MULTI_AUTH_CONFIG_PATH = configPath;
+    await fs.writeFile(
+      configPath,
+      JSON.stringify({ codexMode: true, preserved: 1 }),
+      "utf8",
+    );
+
+    const originalReadFile = fs.readFile.bind(fs);
+    const readSpy = vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+      const [targetPath] = args;
+      if (targetPath === configPath) {
+        const error = new Error("busy") as NodeJS.ErrnoException;
+        error.code = "EBUSY";
+        throw error;
+      }
+      return originalReadFile(...args);
+    });
+
+    try {
+      const { savePluginConfig } = await import("../lib/config.js");
+      await expect(savePluginConfig({ codexMode: false })).rejects.toThrow(
+        "unreadable",
+      );
+    } finally {
+      readSpy.mockRestore();
+    }
+
+    const parsed = JSON.parse(await fs.readFile(configPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(parsed).toEqual({ codexMode: true, preserved: 1 });
+  });
+
+  // §4.3 error-contract adoption: the unreadable-abort is a typed StorageError
+  // carrying the config path, so callers can branch on the class/path instead
+  // of the message text (which is unchanged).
+  it("aborts with a typed StorageError naming the unreadable config path", async () => {
+    const configPath = join(tempDir, "plugin-config.json");
+    process.env.CODEX_MULTI_AUTH_CONFIG_PATH = configPath;
+    await fs.writeFile(configPath, JSON.stringify({ codexMode: true }), "utf8");
+
+    const originalReadFile = fs.readFile.bind(fs);
+    const readSpy = vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+      const [targetPath] = args;
+      if (targetPath === configPath) {
+        const error = new Error("busy") as NodeJS.ErrnoException;
+        error.code = "EBUSY";
+        throw error;
+      }
+      return originalReadFile(...args);
+    });
+
+    try {
+      const { savePluginConfig } = await import("../lib/config.js");
+      const { StorageError } = await import("../lib/errors.js");
+      const thrown = await savePluginConfig({ codexMode: false }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(thrown).toBeInstanceOf(StorageError);
+      expect((thrown as InstanceType<typeof StorageError>).path).toBe(
+        configPath,
+      );
+      expect((thrown as InstanceType<typeof StorageError>).code).toBe(
+        "UNREADABLE",
+      );
+      expect((thrown as Error).message).toBe(
+        `Aborting config save because ${configPath} is unreadable.`,
+      );
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it("treats non-retryable env-path read failures as unreadable", async () => {
+    const configPath = join(tempDir, "plugin-config.json");
+    process.env.CODEX_MULTI_AUTH_CONFIG_PATH = configPath;
+    await fs.writeFile(
+      configPath,
+      JSON.stringify({ codexMode: true, preserved: 1 }),
+      "utf8",
+    );
+
+    const originalReadFile = fs.readFile.bind(fs);
+    const readSpy = vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+      const [targetPath] = args;
+      if (targetPath === configPath) {
+        const error = new Error("permission denied") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }
+      return originalReadFile(...args);
+    });
+
+    try {
+      const { savePluginConfig } = await import("../lib/config.js");
+      await expect(savePluginConfig({ codexMode: false })).rejects.toThrow(
+        "unreadable",
+      );
+    } finally {
+      readSpy.mockRestore();
+    }
+
+    const parsed = JSON.parse(await fs.readFile(configPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(parsed).toEqual({ codexMode: true, preserved: 1 });
+  });
+
+  it("does not overwrite an unreadable unified settings file", async () => {
+    delete process.env.CODEX_MULTI_AUTH_CONFIG_PATH;
+    const unifiedPath = join(tempDir, "settings.json");
+    await fs.writeFile(
+      unifiedPath,
+      JSON.stringify({
+        version: 1,
+        pluginConfig: { codexMode: true, preserved: 1 },
+        dashboardDisplaySettings: { uiThemePreset: "green" },
+      }),
+      "utf8",
+    );
+
+    const originalReadFile = fs.readFile.bind(fs);
+    const readSpy = vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+      const [targetPath] = args;
+      if (targetPath === unifiedPath) {
+        const error = new Error("busy") as NodeJS.ErrnoException;
+        error.code = "EBUSY";
+        throw error;
+      }
+      return originalReadFile(...args);
+    });
+
+    try {
+      const { savePluginConfig } = await import("../lib/config.js");
+      await expect(savePluginConfig({ codexMode: false })).rejects.toThrow(
+        "unreadable",
+      );
+    } finally {
+      readSpy.mockRestore();
+    }
+
+    const parsed = JSON.parse(await fs.readFile(unifiedPath, "utf8")) as {
+      pluginConfig?: Record<string, unknown>;
+      dashboardDisplaySettings?: Record<string, unknown>;
+    };
+    expect(parsed.pluginConfig).toEqual({ codexMode: true, preserved: 1 });
+    expect(parsed.dashboardDisplaySettings).toEqual({ uiThemePreset: "green" });
+  });
+
+  it("falls back to standalone config when unified settings are invalid", async () => {
+    delete process.env.CODEX_MULTI_AUTH_CONFIG_PATH;
+    const unifiedPath = join(tempDir, "settings.json");
+    const standalonePath = join(tempDir, "config.json");
+    await fs.writeFile(unifiedPath, "{ invalid json", "utf8");
+    await fs.writeFile(
+      standalonePath,
+      JSON.stringify({ codexMode: true, preserved: 1 }),
+      "utf8",
+    );
+
+    const { savePluginConfig } = await import("../lib/config.js");
+    await savePluginConfig({ fastSession: true });
+
+    const parsed = JSON.parse(await fs.readFile(unifiedPath, "utf8")) as {
+      pluginConfig?: Record<string, unknown>;
+    };
+    expect(parsed.pluginConfig).toEqual({
+      codexMode: true,
+      preserved: 1,
+      fastSession: true,
+    });
+  });
+
+  it("resolves parallel probing settings and clamps concurrency", async () => {
+    const { getParallelProbing, getParallelProbingMaxConcurrency } =
+      await import("../lib/config.js");
+
+    process.env.CODEX_AUTH_PARALLEL_PROBING = "1";
+    expect(getParallelProbing({ parallelProbing: false })).toBe(true);
+    process.env.CODEX_AUTH_PARALLEL_PROBING = "0";
+    expect(getParallelProbing({ parallelProbing: true })).toBe(false);
+
+    process.env.CODEX_AUTH_PARALLEL_PROBING_MAX_CONCURRENCY = "not-a-number";
+    expect(
+      getParallelProbingMaxConcurrency({ parallelProbingMaxConcurrency: 4 }),
+    ).toBe(4);
+
+    process.env.CODEX_AUTH_PARALLEL_PROBING_MAX_CONCURRENCY = "0";
+    expect(
+      getParallelProbingMaxConcurrency({ parallelProbingMaxConcurrency: 4 }),
+    ).toBe(1);
+  });
+
+  it("does not warn for blank numeric env overrides", async () => {
+    process.env.CODEX_AUTH_PARALLEL_PROBING_MAX_CONCURRENCY = "";
+    vi.resetModules();
+    const logWarnMock = vi.fn();
+
+    vi.doMock("../lib/logger.js", async () => {
+      const actual =
+        await vi.importActual<typeof import("../lib/logger.js")>(
+          "../lib/logger.js",
+        );
+      return {
+        ...actual,
+        logWarn: logWarnMock,
+      };
+    });
+
+    try {
+      const { getParallelProbingMaxConcurrency } = await import(
+        "../lib/config.js"
+      );
+      expect(
+        getParallelProbingMaxConcurrency({ parallelProbingMaxConcurrency: 4 }),
+      ).toBe(4);
+      expect(logWarnMock).not.toHaveBeenCalled();
+    } finally {
+      vi.doUnmock("../lib/logger.js");
+    }
+  });
+
+  it("does not warn for blank boolean env overrides", async () => {
+    process.env.CODEX_AUTH_PARALLEL_PROBING = "";
+    vi.resetModules();
+    const logWarnMock = vi.fn();
+
+    vi.doMock("../lib/logger.js", async () => {
+      const actual =
+        await vi.importActual<typeof import("../lib/logger.js")>(
+          "../lib/logger.js",
+        );
+      return {
+        ...actual,
+        logWarn: logWarnMock,
+      };
+    });
+
+    try {
+      const { getParallelProbing } = await import("../lib/config.js");
+      expect(getParallelProbing({ parallelProbing: false })).toBe(false);
+      expect(logWarnMock).not.toHaveBeenCalled();
+    } finally {
+      vi.doUnmock("../lib/logger.js");
+    }
+  });
+
+  it("redacts raw values from invalid boolean env override warnings", async () => {
+    process.env.CODEX_AUTH_PARALLEL_PROBING = "secret-bool";
+    vi.resetModules();
+    const logWarnMock = vi.fn();
+
+    vi.doMock("../lib/logger.js", async () => {
+      const actual =
+        await vi.importActual<typeof import("../lib/logger.js")>(
+          "../lib/logger.js",
+        );
+      return {
+        ...actual,
+        logWarn: logWarnMock,
+      };
+    });
+
+    try {
+      const { getParallelProbing } = await import("../lib/config.js");
+      expect(getParallelProbing({ parallelProbing: false })).toBe(false);
+      expect(logWarnMock).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "Ignoring invalid boolean env CODEX_AUTH_PARALLEL_PROBING.",
+        ),
+      );
+      expect(logWarnMock).not.toHaveBeenCalledWith(
+        expect.stringContaining("secret-bool"),
+      );
+    } finally {
+      vi.doUnmock("../lib/logger.js");
+    }
+  });
+
+  it("redacts raw values from invalid numeric env override warnings", async () => {
+    process.env.CODEX_AUTH_PARALLEL_PROBING_MAX_CONCURRENCY = "secret-value";
+    vi.resetModules();
+    const logWarnMock = vi.fn();
+
+    vi.doMock("../lib/logger.js", async () => {
+      const actual =
+        await vi.importActual<typeof import("../lib/logger.js")>(
+          "../lib/logger.js",
+        );
+      return {
+        ...actual,
+        logWarn: logWarnMock,
+      };
+    });
+
+    try {
+      const { getParallelProbingMaxConcurrency } = await import(
+        "../lib/config.js"
+      );
+      expect(
+        getParallelProbingMaxConcurrency({ parallelProbingMaxConcurrency: 4 }),
+      ).toBe(4);
+      expect(logWarnMock).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "Ignoring invalid numeric env CODEX_AUTH_PARALLEL_PROBING_MAX_CONCURRENCY.",
+        ),
+      );
+      expect(logWarnMock).not.toHaveBeenCalledWith(
+        expect.stringContaining("secret-value"),
+      );
+    } finally {
+      vi.doUnmock("../lib/logger.js");
+    }
+  });
+
+  it("normalizes fallback chain and drops invalid entries", async () => {
+    const { getUnsupportedCodexFallbackChain } =
+      await import("../lib/config.js");
+
+    const chain = getUnsupportedCodexFallbackChain({
+      unsupportedCodexFallbackChain: {
+        " OpenAI/GPT-5.3-CODEX ": ["gpt-5.2-codex", 99 as unknown as string],
+        "gpt-5.3-codex-mini": "gpt-5" as unknown as string[],
+      },
+    });
+
+    expect(chain).toEqual({
+      "gpt-5.3-codex": ["gpt-5.2-codex"],
+    });
+  });
+
+  it("loads global legacy config and auth paths when discovered", async () => {
+    delete process.env.CODEX_HOME;
+
+    const runCase = async (legacyFilename: string) => {
+      vi.resetModules();
+      const existsSyncMock = vi.fn((candidate: unknown) => {
+        if (typeof candidate !== "string") return false;
+        const normalized = candidate.replace(/\\/g, "/");
+        return normalized.endsWith(`/${legacyFilename}`);
+      });
+      const readFileSyncMock = vi.fn(() =>
+        JSON.stringify({ codexMode: false }),
+      );
+      const logWarnMock = vi.fn();
+
+      vi.doMock("node:fs", async () => {
+        const actual =
+          await vi.importActual<typeof import("node:fs")>("node:fs");
+        return {
+          ...actual,
+          existsSync: existsSyncMock,
+          readFileSync: readFileSyncMock,
+        };
+      });
+      vi.doMock("../lib/logger.js", async () => {
+        const actual =
+          await vi.importActual<typeof import("../lib/logger.js")>(
+            "../lib/logger.js",
+          );
+        return {
+          ...actual,
+          logWarn: logWarnMock,
+        };
+      });
+
+      try {
+        const configModule = await import("../lib/config.js");
+        const loaded = configModule.loadPluginConfig();
+        expect(loaded.codexMode).toBe(false);
+        expect(readFileSyncMock).toHaveBeenCalled();
+        expect(logWarnMock).toHaveBeenCalledWith(
+          expect.stringContaining(legacyFilename),
+        );
+      } finally {
+        vi.doUnmock("node:fs");
+        vi.doUnmock("../lib/logger.js");
+      }
+    };
+
+    await runCase("codex-multi-auth-config.json");
+    await runCase("openai-codex-auth-config.json");
+  });
+});

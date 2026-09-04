@@ -1,0 +1,697 @@
+import { existsSync, promises as fs } from "node:fs";
+import { dirname } from "node:path";
+import { createLogger } from "../logger.js";
+import {
+	clearCodexCliStateCache,
+	getCodexCliAccountsPath,
+	getCodexCliAuthPath,
+	getCodexCliConfigPath,
+	isCodexCliSyncEnabled,
+} from "./state.js";
+import {
+	incrementCodexCliMetric,
+	makeAccountFingerprint,
+} from "./observability.js";
+import { tempPathFor } from "../temp-path.js";
+
+const log = createLogger("codex-cli-writer");
+let lastCodexCliSelectionWriteAt = 0;
+let activeSelectionWriteQueue: Promise<void> = Promise.resolve();
+
+interface ActiveSelection {
+	accountId?: string;
+	email?: string;
+	accessToken?: string;
+	refreshToken?: string;
+	expiresAt?: number;
+	idToken?: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function readTrimmedString(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function readNumber(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value)) return value;
+	if (typeof value === "string") {
+		const parsed = Number(value);
+		if (Number.isFinite(parsed)) return parsed;
+	}
+	return undefined;
+}
+
+function extractTokenFromRecord(
+	record: Record<string, unknown>,
+	keys: string[],
+): string | undefined {
+	for (const key of keys) {
+		const token = readTrimmedString(record[key]);
+		if (token) return token;
+	}
+	return undefined;
+}
+
+function normalizeEmail(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim().toLowerCase();
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function readAccountId(record: Record<string, unknown>): string | undefined {
+	const keys = ["accountId", "account_id", "workspace_id", "organization_id", "id"];
+	for (const key of keys) {
+		const value = record[key];
+		if (typeof value !== "string") continue;
+		const trimmed = value.trim();
+		if (trimmed.length > 0) return trimmed;
+	}
+	return undefined;
+}
+
+function extractSelectionFromAccountRecord(record: Record<string, unknown>): ActiveSelection {
+	const auth = isRecord(record.auth) ? record.auth : undefined;
+	const tokens = auth && isRecord(auth.tokens) ? auth.tokens : undefined;
+
+	const accessToken =
+		extractTokenFromRecord(record, ["accessToken", "access_token"]) ??
+		(tokens ? extractTokenFromRecord(tokens, ["access_token", "accessToken"]) : undefined);
+	const refreshToken =
+		extractTokenFromRecord(record, ["refreshToken", "refresh_token"]) ??
+		(tokens ? extractTokenFromRecord(tokens, ["refresh_token", "refreshToken"]) : undefined);
+	const accountId =
+		readAccountId(record) ??
+		(tokens ? readTrimmedString(tokens.account_id) ?? readTrimmedString(tokens.accountId) : undefined);
+	const idToken =
+		extractTokenFromRecord(record, ["idToken", "id_token"]) ??
+		(tokens ? extractTokenFromRecord(tokens, ["id_token", "idToken"]) : undefined);
+	const email =
+		normalizeEmail(record.email) ??
+		normalizeEmail(record.user_email) ??
+		normalizeEmail(record.username);
+	const expiresAt =
+		readNumber(record.expiresAt) ??
+		readNumber(record.expires_at) ??
+		(tokens ? readNumber(tokens.expires_at) : undefined);
+
+	return {
+		accountId,
+		email,
+		accessToken,
+		refreshToken,
+		expiresAt,
+		idToken,
+	};
+}
+
+function enrichActiveAccountRecordWithTokens(
+	record: Record<string, unknown>,
+	selection: ActiveSelection,
+): Record<string, unknown> {
+	const auth = isRecord(record.auth) ? { ...record.auth } : {};
+	const tokens = isRecord(auth.tokens) ? { ...auth.tokens } : {};
+
+	const currentAccess =
+		extractTokenFromRecord(record, ["accessToken", "access_token"]) ??
+		extractTokenFromRecord(tokens, ["access_token", "accessToken"]);
+	const currentRefresh =
+		extractTokenFromRecord(record, ["refreshToken", "refresh_token"]) ??
+		extractTokenFromRecord(tokens, ["refresh_token", "refreshToken"]);
+	const currentIdToken =
+		extractTokenFromRecord(record, ["idToken", "id_token"]) ??
+		extractTokenFromRecord(tokens, ["id_token", "idToken"]);
+
+	const selectedAccess = readTrimmedString(selection.accessToken);
+	const selectedRefresh = readTrimmedString(selection.refreshToken);
+	const selectedIdToken = readTrimmedString(selection.idToken);
+	const accountId = selection.accountId?.trim() || readAccountId(record);
+	const email = normalizeEmail(selection.email) ?? normalizeEmail(record.email);
+
+	const accessToken = selectedAccess ?? currentAccess;
+	const refreshToken = selectedRefresh ?? currentRefresh;
+	if (!accessToken || !refreshToken) {
+		return record;
+	}
+
+	const idToken = selectedIdToken ?? currentIdToken ?? accessToken;
+	const next = { ...record } as Record<string, unknown>;
+
+	next.accessToken = accessToken;
+	next.access_token = accessToken;
+	next.refreshToken = refreshToken;
+	next.refresh_token = refreshToken;
+	if (idToken) {
+		next.idToken = idToken;
+		next.id_token = idToken;
+	}
+	if (accountId) {
+		next.accountId = accountId;
+		next.account_id = accountId;
+	}
+	if (email) {
+		next.email = email;
+	}
+
+	const nextTokens = { ...tokens } as Record<string, unknown>;
+	nextTokens.access_token = accessToken;
+	nextTokens.accessToken = accessToken;
+	nextTokens.refresh_token = refreshToken;
+	nextTokens.refreshToken = refreshToken;
+	if (idToken) {
+		nextTokens.id_token = idToken;
+		nextTokens.idToken = idToken;
+	}
+	if (accountId) {
+		nextTokens.account_id = accountId;
+		nextTokens.accountId = accountId;
+	}
+	auth.tokens = nextTokens;
+	next.auth = auth;
+
+	return next;
+}
+
+function resolveMatchIndex(
+	accounts: unknown[],
+	selection: ActiveSelection,
+): number {
+	const desiredId = selection.accountId?.trim();
+	const desiredEmail = normalizeEmail(selection.email);
+
+	if (desiredId) {
+		const byId = accounts.findIndex((entry) => {
+			if (!isRecord(entry)) return false;
+			return readAccountId(entry) === desiredId;
+		});
+		if (byId >= 0) return byId;
+	}
+
+	if (desiredEmail) {
+		const byEmail = accounts.findIndex((entry) => {
+			if (!isRecord(entry)) return false;
+			return normalizeEmail(entry.email) === desiredEmail;
+		});
+		if (byEmail >= 0) return byEmail;
+	}
+
+	return -1;
+}
+
+function toIsoTime(ms: number | undefined): string {
+	if (typeof ms === "number" && Number.isFinite(ms) && ms > 0) {
+		return new Date(ms).toISOString();
+	}
+	return new Date().toISOString();
+}
+
+async function atomicWriteText(path: string, content: string): Promise<void> {
+	const tempPath = tempPathFor(path);
+	await fs.mkdir(dirname(path), { recursive: true });
+	try {
+		await fs.writeFile(tempPath, content, {
+			encoding: "utf-8",
+			mode: 0o600,
+		});
+
+		let lastRenameError: NodeJS.ErrnoException | null = null;
+		for (let attempt = 0; attempt < 5; attempt += 1) {
+			try {
+				await fs.rename(tempPath, path);
+				return;
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if (code === "EPERM" || code === "EBUSY") {
+					lastRenameError = error as NodeJS.ErrnoException;
+					await new Promise((resolve) => setTimeout(resolve, 10 * 2 ** attempt));
+					continue;
+				}
+				throw error;
+			}
+		}
+		if (lastRenameError) throw lastRenameError;
+	} finally {
+		try {
+			await fs.unlink(tempPath);
+		} catch {
+			// Best effort temp-file cleanup.
+		}
+	}
+}
+
+async function atomicWriteJson(path: string, payload: Record<string, unknown>): Promise<void> {
+	return atomicWriteText(path, JSON.stringify(payload, null, 2));
+}
+
+/**
+ * Whether `config.toml` may be rewritten to pin the credential store.
+ *
+ * Exported so callers that only *plan* a rewrite — `doctor --fix --dry-run` —
+ * can report the same outcome the real run would produce, instead of promising
+ * a change the opt-out would suppress.
+ */
+export function shouldEnforceCodexCliFileAuthStore(): boolean {
+	const override = (process.env.CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE ?? "1").trim();
+	return override !== "0";
+}
+
+/**
+ * Matches a complete TOML table header, mirroring `readTomlTableName` in
+ * `lib/runtime/config-toml.ts` (plus an optional trailing comment).
+ *
+ * A loose `/^\s*\[/` would also match a continuation line of a multi-line array
+ * such as `[1, 2],`, cutting the top-level scan short. The writer would then
+ * miss a real top-level assignment below it and insert a second one — a
+ * duplicate key, which is invalid TOML and stops the official CLI from starting.
+ */
+const TOML_TABLE_HEADER_PATTERN = /^\s*\[{1,2}\s*[^\]]+?\s*\]{1,2}\s*(?:#.*)?$/;
+
+function ensureTrailingNewline(value: string, lineEnding = "\n"): string {
+	return value.endsWith("\n") ? value : `${value}${lineEnding}`;
+}
+
+/**
+ * Reads the top-level `cli_auth_credentials_store` value out of a raw
+ * `config.toml`.
+ *
+ * Mirrors the scoping rules of {@link ensureCodexCliFileAuthStore}: assignments
+ * inside a `[table]` belong to that table, so only lines before the first table
+ * header describe the official CLI's default credential store. Reporting a
+ * profile-scoped value as the effective one would let `doctor` call a config
+ * healthy while the CLI still reaches for the keychain.
+ *
+ * Both TOML string forms count. A literal string (`'file'`) is as valid as a
+ * basic string (`"file"`), so treating only the latter as real would make
+ * `doctor` warn about a perfectly healthy config. Literal strings have no
+ * escape sequences, and the values in play here are bare identifiers, so a
+ * non-greedy character class is an exact match for both forms.
+ *
+ * @param rawConfig - Full text of `config.toml`.
+ * @returns The declared mode, or `null` when no top-level assignment exists.
+ */
+export function readTopLevelCodexCliAuthStoreMode(rawConfig: string): string | null {
+	for (const line of rawConfig.split(/\r?\n/)) {
+		if (TOML_TABLE_HEADER_PATTERN.test(line)) break;
+		const match = line.match(
+			/^\s*cli_auth_credentials_store\s*=\s*(?:"([^"]*)"|'([^']*)')\s*(?:#.*)?$/,
+		);
+		if (match) return (match[1] ?? match[2] ?? "").trim() || null;
+	}
+	return null;
+}
+
+/**
+ * Persists `cli_auth_credentials_store = "file"` as a top-level key in the
+ * official Codex CLI `config.toml`.
+ *
+ * The wrapper already appends `-c cli_auth_credentials_store="file"` to every
+ * command it forwards, but that only covers processes it launches itself.
+ * Third-party front-ends (menu-bar apps such as CodexBar, editor extensions)
+ * exec the official binary directly, so the *persisted* value is what decides
+ * whether the official CLI reaches into the macOS login keychain. Leaving it on
+ * `"keychain"` is what produces the repeated "Always Allow" prompts reported in
+ * issue #641.
+ *
+ * Only top-level assignments are rewritten. A `cli_auth_credentials_store`
+ * inside a `[profiles.*]` table must be left alone: rewriting it in place would
+ * mangle a scoped setting while still leaving the top-level default pointed at
+ * the keychain, so the prompts would continue.
+ *
+ * @param configPath - Config file to reconcile; defaults to the resolved Codex
+ * CLI `config.toml`.
+ * @returns `true` when the file was rewritten, `false` when it was already
+ * correct or enforcement is disabled.
+ */
+export async function ensureCodexCliFileAuthStore(
+	configPath: string = getCodexCliConfigPath(),
+): Promise<boolean> {
+	if (!shouldEnforceCodexCliFileAuthStore()) return false;
+
+	const desired = 'cli_auth_credentials_store = "file"';
+	const raw = existsSync(configPath) ? await fs.readFile(configPath, "utf-8") : "";
+
+	// Quote style is not ours to normalize: a literal-string `'file'` already
+	// keeps the CLI off the keychain, so rewriting it to `"file"` would churn a
+	// healthy config on every wrapper startup for no behavioral gain.
+	if (readTopLevelCodexCliAuthStoreMode(raw) === "file") return false;
+
+	// Preserve the file's existing line endings, as the runtime config rewriter
+	// does. Splitting on /\r?\n/ and rejoining with "\n" would silently convert a
+	// CRLF config.toml to LF -- an edit the user never asked for, and one this
+	// code now risks on every wrapper startup rather than only on account switch.
+	const lineEnding = raw.includes("\r\n") ? "\r\n" : "\n";
+	const lines = raw.length > 0 ? raw.split(/\r?\n/) : [];
+	const assignmentRegex = /^\s*cli_auth_credentials_store\s*=/;
+
+	let replaced = false;
+	let inTopLevelTable = true;
+	const nextLines = lines.map((line) => {
+		if (TOML_TABLE_HEADER_PATTERN.test(line)) inTopLevelTable = false;
+		if (inTopLevelTable && !replaced && assignmentRegex.test(line)) {
+			replaced = true;
+			return desired;
+		}
+		return line;
+	});
+
+	if (!replaced) {
+		let insertAt = nextLines.findIndex((line) =>
+			TOML_TABLE_HEADER_PATTERN.test(line),
+		);
+		if (insertAt < 0) insertAt = nextLines.length;
+		nextLines.splice(insertAt, 0, desired);
+		if (insertAt < nextLines.length - 1 && nextLines[insertAt + 1]?.trim().length !== 0) {
+			nextLines.splice(insertAt + 1, 0, "");
+		}
+	}
+
+	const nextRaw = ensureTrailingNewline(nextLines.join(lineEnding), lineEnding);
+	if (nextRaw === ensureTrailingNewline(raw, lineEnding)) {
+		return false;
+	}
+
+	await atomicWriteText(configPath, nextRaw);
+	return true;
+}
+
+async function writeCodexAuthState(
+	path: string,
+	selection: ActiveSelection,
+): Promise<boolean> {
+	const raw = existsSync(path) ? await fs.readFile(path, "utf-8") : "{}";
+	const parsed = JSON.parse(raw) as unknown;
+	if (!isRecord(parsed)) {
+		log.warn("Failed to persist Codex auth selection", {
+			operation: "write-active-selection",
+			outcome: "malformed-auth-state",
+			path,
+		});
+		return false;
+	}
+
+	const existingTokens = isRecord(parsed.tokens) ? parsed.tokens : {};
+	const next = { ...parsed } as Record<string, unknown>;
+	const nextTokens = { ...existingTokens } as Record<string, unknown>;
+
+	const syncVersion = Date.now();
+	const selectedAccessToken = readTrimmedString(selection.accessToken);
+	const selectedRefreshToken = readTrimmedString(selection.refreshToken);
+	const existingAccessToken =
+		typeof existingTokens.access_token === "string" ? existingTokens.access_token : undefined;
+	const existingRefreshToken =
+		typeof existingTokens.refresh_token === "string" ? existingTokens.refresh_token : undefined;
+	const hasSelectedAccess = typeof selectedAccessToken === "string" && selectedAccessToken.length > 0;
+	const hasSelectedRefresh = typeof selectedRefreshToken === "string" && selectedRefreshToken.length > 0;
+	const selectedTokenPair = hasSelectedAccess && hasSelectedRefresh;
+	let accessToken: string | undefined;
+	let refreshToken: string | undefined;
+
+	if (selectedTokenPair) {
+		accessToken = selectedAccessToken;
+		refreshToken = selectedRefreshToken;
+	} else if (!hasSelectedAccess && !hasSelectedRefresh) {
+		accessToken = existingAccessToken;
+		refreshToken = existingRefreshToken;
+	} else {
+		log.warn("Failed to persist Codex auth selection", {
+			operation: "write-active-selection",
+			outcome: "partial-token-payload",
+			path,
+			accountRef: makeAccountFingerprint({
+				accountId: selection.accountId,
+				email: selection.email,
+			}),
+		});
+		return false;
+	}
+
+	if (!accessToken || !refreshToken) {
+		log.warn("Failed to persist Codex auth selection", {
+			operation: "write-active-selection",
+			outcome: "missing-token-payload",
+			path,
+			accountRef: makeAccountFingerprint({
+				accountId: selection.accountId,
+				email: selection.email,
+			}),
+		});
+		return false;
+	}
+
+	next.auth_mode = typeof parsed.auth_mode === "string" ? parsed.auth_mode : "chatgpt";
+	next.OPENAI_API_KEY = null;
+	const selectedEmail = normalizeEmail(selection.email);
+	if (selectedEmail) {
+		next.email = selectedEmail;
+	}
+	nextTokens.access_token = accessToken;
+	nextTokens.refresh_token = refreshToken;
+	if (selection.accountId?.trim()) {
+		nextTokens.account_id = selection.accountId.trim();
+	}
+	const selectedIdToken = readTrimmedString(selection.idToken);
+	const existingIdToken = readTrimmedString(existingTokens.id_token);
+	const fallbackIdToken = selectedTokenPair ? accessToken : (existingIdToken ?? accessToken);
+	if (selectedIdToken) {
+		nextTokens.id_token = selectedIdToken;
+	} else if (fallbackIdToken) {
+		nextTokens.id_token = fallbackIdToken;
+	}
+	next.tokens = nextTokens;
+	next.last_refresh = toIsoTime(selection.expiresAt);
+	next.codexMultiAuthSyncVersion = syncVersion;
+
+	await atomicWriteJson(path, next);
+	lastCodexCliSelectionWriteAt = Math.max(lastCodexCliSelectionWriteAt, syncVersion);
+	return true;
+}
+
+async function enqueueActiveSelectionWrite<T>(task: () => Promise<T>): Promise<T> {
+	let releaseQueue!: () => void;
+	const queueTail = new Promise<void>((resolve) => {
+		releaseQueue = resolve;
+	});
+	const previous = activeSelectionWriteQueue;
+	activeSelectionWriteQueue = previous
+		.catch(() => {
+			// Keep queue alive even if a previous task failed.
+		})
+		.then(() => queueTail);
+	await previous.catch(() => {
+		// Ignore previous failure, current task still runs.
+	});
+	try {
+		return await task();
+	} finally {
+		releaseQueue();
+	}
+}
+
+export async function setCodexCliActiveSelection(
+	selection: ActiveSelection,
+): Promise<boolean> {
+	return enqueueActiveSelectionWrite(async () => {
+		if (!isCodexCliSyncEnabled()) return false;
+
+		incrementCodexCliMetric("writeAttempts");
+		const accountsPath = getCodexCliAccountsPath();
+		const authPath = getCodexCliAuthPath();
+		const configPath = getCodexCliConfigPath();
+		const hasAccountsPath = existsSync(accountsPath);
+		const hasAuthPath = existsSync(authPath);
+		const selectionHasTokens =
+			typeof selection.accessToken === "string" &&
+			selection.accessToken.trim().length > 0 &&
+			typeof selection.refreshToken === "string" &&
+			selection.refreshToken.trim().length > 0;
+		const requireAuthWrite = hasAuthPath || selectionHasTokens;
+
+		if (!hasAccountsPath && !hasAuthPath && !selectionHasTokens) {
+			incrementCodexCliMetric("writeFailures");
+			return false;
+		}
+
+		try {
+			let resolvedSelection: ActiveSelection = { ...selection };
+			let wroteAccounts = false;
+			let wroteAuth = false;
+			let wroteConfig = false;
+
+			if (hasAccountsPath) {
+				const raw = await fs.readFile(accountsPath, "utf-8");
+				const parsed = JSON.parse(raw) as unknown;
+				if (!isRecord(parsed) || !Array.isArray(parsed.accounts)) {
+					log.warn("Failed to persist Codex CLI active selection", {
+						operation: "write-active-selection",
+						outcome: "malformed",
+						path: accountsPath,
+					});
+				} else {
+					const matchIndex = resolveMatchIndex(parsed.accounts, selection);
+					if (matchIndex < 0) {
+						const hasSelectionTokens =
+							typeof selection.accessToken === "string" &&
+							selection.accessToken.trim().length > 0 &&
+							typeof selection.refreshToken === "string" &&
+							selection.refreshToken.trim().length > 0;
+						log.warn("Failed to persist Codex CLI active selection", {
+							operation: "write-active-selection",
+							outcome: "no-match",
+							path: accountsPath,
+							accountRef: makeAccountFingerprint({
+								accountId: selection.accountId,
+								email: selection.email,
+							}),
+						});
+						if (!hasAuthPath || !hasSelectionTokens) {
+							incrementCodexCliMetric("writeFailures");
+							return false;
+						}
+					} else {
+						const chosen = parsed.accounts[matchIndex];
+						if (!isRecord(chosen)) {
+							log.warn("Failed to persist Codex CLI active selection", {
+								operation: "write-active-selection",
+								outcome: "invalid-account-record",
+								path: accountsPath,
+							});
+							if (!hasAuthPath) {
+								incrementCodexCliMetric("writeFailures");
+								return false;
+							}
+						} else {
+							const chosenSelection = extractSelectionFromAccountRecord(chosen);
+							resolvedSelection = {
+								...resolvedSelection,
+								accountId: resolvedSelection.accountId ?? chosenSelection.accountId,
+								email: resolvedSelection.email ?? chosenSelection.email,
+								accessToken: resolvedSelection.accessToken ?? chosenSelection.accessToken,
+								refreshToken: resolvedSelection.refreshToken ?? chosenSelection.refreshToken,
+								expiresAt: resolvedSelection.expiresAt ?? chosenSelection.expiresAt,
+								idToken: resolvedSelection.idToken ?? chosenSelection.idToken,
+							};
+
+							const next = { ...parsed };
+							const syncVersion = Date.now();
+							const chosenAccountId = readAccountId(chosen) ?? selection.accountId?.trim();
+							const chosenEmail = normalizeEmail(chosen.email) ?? normalizeEmail(selection.email);
+
+							if (chosenAccountId) {
+								next.activeAccountId = chosenAccountId;
+								next.active_account_id = chosenAccountId;
+							}
+							if (chosenEmail) {
+								next.activeEmail = chosenEmail;
+								next.active_email = chosenEmail;
+							}
+
+							next.accounts = parsed.accounts.map((entry, index) => {
+								if (!isRecord(entry)) return entry;
+								let updated = { ...entry } as Record<string, unknown>;
+								if (index === matchIndex) {
+									updated = enrichActiveAccountRecordWithTokens(updated, resolvedSelection);
+								}
+								updated.active = index === matchIndex;
+								updated.isActive = index === matchIndex;
+								updated.is_active = index === matchIndex;
+								return updated;
+							});
+							next.codexMultiAuthSyncVersion = syncVersion;
+
+							await atomicWriteJson(accountsPath, next);
+							lastCodexCliSelectionWriteAt = Math.max(lastCodexCliSelectionWriteAt, syncVersion);
+							wroteAccounts = true;
+							log.debug("Persisted Codex CLI accounts selection", {
+								operation: "write-active-selection",
+								outcome: "success",
+								path: accountsPath,
+								accountRef: makeAccountFingerprint({
+									accountId: chosenAccountId,
+									email: chosenEmail,
+								}),
+							});
+						}
+					}
+				}
+			}
+
+			if (hasAuthPath || wroteAccounts || selectionHasTokens) {
+				wroteAuth = await writeCodexAuthState(authPath, resolvedSelection);
+				if (!wroteAuth) {
+					log.warn("Codex auth state update skipped after accounts selection update", {
+						operation: "write-active-selection",
+						outcome: "accounts-updated-auth-failed",
+						path: authPath,
+						accountRef: makeAccountFingerprint({
+							accountId: resolvedSelection.accountId,
+							email: resolvedSelection.email,
+						}),
+					});
+					if (requireAuthWrite || !wroteAccounts) {
+						incrementCodexCliMetric("writeFailures");
+						return false;
+					}
+				} else {
+					log.debug("Persisted Codex auth active selection", {
+						operation: "write-active-selection",
+						outcome: "success",
+						path: authPath,
+						accountRef: makeAccountFingerprint({
+							accountId: resolvedSelection.accountId,
+							email: resolvedSelection.email,
+						}),
+					});
+				}
+			}
+
+			try {
+				wroteConfig = await ensureCodexCliFileAuthStore(configPath);
+			} catch (error) {
+				log.warn("Failed to persist Codex config file auth store", {
+					operation: "write-active-selection",
+					outcome: "config-auth-store-update-failed",
+					path: configPath,
+					error: String(error),
+				});
+			}
+
+			if (wroteAccounts || wroteAuth) {
+				clearCodexCliStateCache();
+				incrementCodexCliMetric("writeSuccesses");
+				return true;
+			}
+
+			if (wroteConfig) {
+				log.debug("Persisted Codex config file auth store override", {
+					operation: "write-active-selection",
+					outcome: "config-updated-only",
+					path: configPath,
+				});
+			}
+
+			incrementCodexCliMetric("writeFailures");
+			return false;
+		} catch (error) {
+			incrementCodexCliMetric("writeFailures");
+			log.warn("Failed to persist Codex CLI active selection", {
+				operation: "write-active-selection",
+				outcome: "error",
+				path: hasAccountsPath ? accountsPath : authPath,
+				accountRef: makeAccountFingerprint({
+					accountId: selection.accountId,
+					email: selection.email,
+				}),
+				error: String(error),
+			});
+			return false;
+		}
+	});
+}
+
+export function getLastCodexCliSelectionWriteTimestamp(): number {
+	return lastCodexCliSelectionWriteAt;
+}

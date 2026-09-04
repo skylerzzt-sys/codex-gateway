@@ -1,0 +1,237 @@
+import { existsSync, promises as fs } from "node:fs";
+import { dirname } from "node:path";
+import { AnyAccountStorageSchema, safeParseJson } from "../schemas.js";
+import { shouldRetryFileOperation } from "../fs-retry.js";
+import { tempPathFor } from "../temp-path.js";
+import type { AccountStorageV3 } from "./public-types.js";
+
+const EXPORT_RENAME_MAX_ATTEMPTS = 4;
+const EXPORT_RENAME_BASE_DELAY_MS = 25;
+const MAX_IMPORT_BYTES = 4 * 1024 * 1024;
+
+async function renameExportFileWithRetry(
+	sourcePath: string,
+	destinationPath: string,
+): Promise<void> {
+	for (let attempt = 0; attempt < EXPORT_RENAME_MAX_ATTEMPTS; attempt += 1) {
+		try {
+			await fs.rename(sourcePath, destinationPath);
+			return;
+		} catch (error) {
+			// storage-07: use the shared retryable-code set (adds ENOTEMPTY/EACCES)
+			// rather than the local EPERM/EBUSY/EAGAIN subset.
+			const canRetry =
+				shouldRetryFileOperation(error) && attempt + 1 < EXPORT_RENAME_MAX_ATTEMPTS;
+			if (!canRetry) {
+				throw error;
+			}
+			await new Promise((resolve) =>
+				setTimeout(resolve, EXPORT_RENAME_BASE_DELAY_MS * 2 ** attempt),
+			);
+		}
+	}
+}
+
+/**
+ * Best-effort removal of the staged export temp file, retried on transient
+ * Windows locks via the same shared retryable-code set as the rename. The temp
+ * file briefly holds the full account export (refresh tokens), so a single-shot
+ * unlink that loses to a transient EACCES/ENOTEMPTY/EBUSY would strand a
+ * secret-bearing `.tmp` next to the destination. Never throws.
+ */
+async function unlinkExportFileBestEffort(tempPath: string): Promise<void> {
+	for (let attempt = 0; attempt < EXPORT_RENAME_MAX_ATTEMPTS; attempt += 1) {
+		try {
+			await fs.unlink(tempPath);
+			return;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException | undefined)?.code;
+			if (code === "ENOENT") return; // already gone (e.g. rename consumed it)
+			const canRetry =
+				shouldRetryFileOperation(error) && attempt + 1 < EXPORT_RENAME_MAX_ATTEMPTS;
+			if (!canRetry) return; // give up silently; cleanup is best-effort
+			await new Promise((resolve) =>
+				setTimeout(resolve, EXPORT_RENAME_BASE_DELAY_MS * 2 ** attempt),
+			);
+		}
+	}
+}
+
+export async function exportAccountsToFile(params: {
+	resolvedPath: string;
+	force: boolean;
+	storage: AccountStorageV3 | null;
+	beforeCommit?: (resolvedPath: string) => Promise<void> | void;
+	logInfo: (message: string, details: Record<string, unknown>) => void;
+}): Promise<void> {
+	if (!params.force && existsSync(params.resolvedPath)) {
+		throw new Error(`File already exists: ${params.resolvedPath}`);
+	}
+	if (!params.storage || params.storage.accounts.length === 0) {
+		throw new Error("No accounts to export");
+	}
+
+	await fs.mkdir(dirname(params.resolvedPath), { recursive: true });
+	await params.beforeCommit?.(params.resolvedPath);
+	if (!params.force && existsSync(params.resolvedPath)) {
+		throw new Error(`File already exists: ${params.resolvedPath}`);
+	}
+
+	const content = JSON.stringify(
+		{
+			version: params.storage.version,
+			accounts: params.storage.accounts,
+			activeIndex: params.storage.activeIndex,
+			activeIndexByFamily: params.storage.activeIndexByFamily,
+		},
+		null,
+		2,
+	);
+	const tempPath = tempPathFor(params.resolvedPath);
+	try {
+		await fs.writeFile(tempPath, content, {
+			encoding: "utf-8",
+			mode: 0o600,
+		});
+		await renameExportFileWithRetry(tempPath, params.resolvedPath);
+	} catch (error) {
+		await unlinkExportFileBestEffort(tempPath);
+		throw error;
+	}
+	params.logInfo("Exported accounts", {
+		path: params.resolvedPath,
+		count: params.storage.accounts.length,
+	});
+}
+
+export async function readImportFile(params: {
+	resolvedPath: string;
+	normalizeAccountStorage: (value: unknown) => AccountStorageV3 | null;
+}): Promise<AccountStorageV3> {
+	if (!existsSync(params.resolvedPath)) {
+		throw new Error(`Import file not found: ${params.resolvedPath}`);
+	}
+
+	const handle = await fs.open(params.resolvedPath, "r");
+	let content: string;
+	try {
+		const stats = await handle.stat();
+		if (stats.size > MAX_IMPORT_BYTES) {
+			throw new Error(
+				`Import file exceeds maximum size of ${MAX_IMPORT_BYTES} bytes: ${params.resolvedPath}`,
+			);
+		}
+		content = await handle.readFile({ encoding: "utf-8" });
+	} finally {
+		await handle.close().catch(() => {
+			// Best-effort cleanup for import file handles.
+		});
+	}
+	// Try the strict Zod-guarded boundary first (fail-closed parse + schema).
+	// A successful parse hands Zod-validated data straight to the normalizer,
+	// making Zod authoritative for imports. On failure we distinguish
+	// SyntaxError (→ "Invalid JSON") from structurally-unknown payloads
+	// (→ pass through to `normalizeAccountStorage` for legacy shapes).
+	const validated = safeParseJson(
+		content,
+		AnyAccountStorageSchema,
+		"storage.readImportFile",
+	);
+	let imported: unknown;
+	if (validated !== null) {
+		imported = validated;
+	} else {
+		try {
+			imported = JSON.parse(content) as unknown;
+		} catch {
+			throw new Error(`Invalid JSON in import file: ${params.resolvedPath}`);
+		}
+	}
+
+	const normalized = params.normalizeAccountStorage(imported);
+	if (!normalized) {
+		throw new Error("Invalid account storage format");
+	}
+	return normalized;
+}
+
+export function mergeImportedAccounts(params: {
+	existing: AccountStorageV3 | null;
+	imported: AccountStorageV3;
+	maxAccounts: number;
+	deduplicateAccounts: (
+		accounts: AccountStorageV3["accounts"],
+	) => AccountStorageV3["accounts"];
+	// Injected like `deduplicateAccounts` rather than imported from ../storage.js,
+	// which would put this leaf module in a dependency cycle with the storage barrel.
+	findMatchingAccountIndex: (
+		accounts: AccountStorageV3["accounts"],
+		candidate: AccountStorageV3["accounts"][number],
+	) => number | undefined;
+}): {
+	newStorage: AccountStorageV3;
+	imported: number;
+	total: number;
+	skipped: number;
+} {
+	const existingAccounts = params.existing?.accounts ?? [];
+	const existingActiveIndex = params.existing?.activeIndex ?? 0;
+	// Resolve the pinned account by IDENTITY before merging. The merged list is
+	// deduplicated below, which can move accounts to different positions, so a raw
+	// positional pin can end up selecting a DIFFERENT account (in range, wrong
+	// account) instead of the one the user pinned.
+	const existingPinnedIndex = params.existing?.pinnedAccountIndex;
+	const pinnedAccount =
+		typeof existingPinnedIndex === "number"
+			? existingAccounts[existingPinnedIndex]
+			: undefined;
+	const merged = [...existingAccounts, ...params.imported.accounts];
+
+	if (merged.length > params.maxAccounts) {
+		const deduped = params.deduplicateAccounts(merged);
+		if (deduped.length > params.maxAccounts) {
+			throw new Error(
+				`Import would exceed maximum of ${params.maxAccounts} accounts (would have ${deduped.length})`,
+			);
+		}
+	}
+
+	const deduplicatedAccounts = params.deduplicateAccounts(merged);
+	const deduplicatedExistingAccounts =
+		params.deduplicateAccounts(existingAccounts);
+	const newStorage: AccountStorageV3 = {
+		version: 3,
+		accounts: deduplicatedAccounts,
+		activeIndex: existingActiveIndex,
+		activeIndexByFamily: params.existing?.activeIndexByFamily,
+	};
+	// Preserve the user's manual pin (#474) and affinity generation across import.
+	// Rebuilding storage from scratch here previously dropped a `switch <n>` pin
+	// and reset affinityGeneration to 0, which lets a running proxy holding a
+	// higher in-memory generation clobber a newer CLI pin. The pin is re-resolved
+	// against the deduplicated list by identity — a range check alone would happily
+	// keep an in-range index that dedupe has repointed at another account. When the
+	// pinned account no longer resolves (removed or ambiguous) the pin is dropped
+	// rather than left pointing somewhere arbitrary.
+	if (pinnedAccount) {
+		const remappedPinnedIndex = params.findMatchingAccountIndex(
+			deduplicatedAccounts,
+			pinnedAccount,
+		);
+		if (remappedPinnedIndex !== undefined) {
+			newStorage.pinnedAccountIndex = remappedPinnedIndex;
+		}
+	}
+	if (typeof params.existing?.affinityGeneration === "number") {
+		newStorage.affinityGeneration = params.existing.affinityGeneration;
+	}
+	const importedCount =
+		deduplicatedAccounts.length - deduplicatedExistingAccounts.length;
+	const skippedCount = params.imported.accounts.length - importedCount;
+	return {
+		newStorage,
+		imported: importedCount,
+		total: deduplicatedAccounts.length,
+		skipped: skippedCount,
+	};
+}
