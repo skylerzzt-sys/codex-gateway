@@ -5,7 +5,7 @@
 ## 设计
 
 - CLI 继续使用 Codex 原生 `personal-gateway` profile。
-- Desktop 继续使用已经在 Windows 验证过的 canonical `~/.codex/config.toml` bind 方案；切换只修改顶层 `model` / `model_provider` 并刷新 `personal_gateway` provider block，不删除会话。
+- Desktop 使用 canonical `~/.codex/config.toml` bind 方案；支持官方 A/B Gateway、TeamoRouter 和官方 OpenAI 三种模式，切换只修改顶层 `model` / `model_provider` 并刷新 `personal_gateway` provider block，不删除会话。
 - Gateway API Key 不写入 TOML、脚本或仓库。macOS 使用 Login Keychain 保存密钥，Codex 的 provider `auth.command` 通过 `/usr/bin/security` 读取。
 - 配置切换完全由 Bash + awk 完成，不经过 PowerShell，不做编码转码；中文注释和中文配置值有专门的 UTF-8 回归测试。
 - `CODEX_HOME` 仍受支持；默认目录是 `~/.codex`。
@@ -32,12 +32,20 @@ bash macos/install.sh
 | 命令 | 用途 |
 | --- | --- |
 | `codex-gateway` | 使用官方 A/B 账号池的 Personal Gateway CLI |
-| `codex-teamo` | 显式使用 `teamo/gpt-5.6-sol` |
-| `codex-gateway-app [path]` | 绑定 Gateway 后打开 Codex Desktop |
-| `codex-gateway-bind` | 只绑定 Desktop，不启动应用 |
+| `codex-teamo` | CLI 显式使用 `teamo/gpt-5.6-sol` |
+| `codex-gateway-app [path]` | 绑定官方 A/B Gateway 后打开 Codex Desktop |
+| `codex-gateway-bind` | 只把 Desktop 绑定到官方 A/B Gateway |
+| `codex-teamo-app [path]` | 绑定 `teamo/gpt-5.6-sol` 后打开 Codex Desktop |
+| `codex-teamo-bind` | 只把 Desktop 绑定到 TeamoRouter |
 | `codex-official` | 恢复官方 OpenAI provider |
 
-`macos/` 目录同时提供与 Windows BAT 对应的 `.command` 双击入口。首次执行 `install.sh` 后即可使用。
+Teamo Desktop 默认模型是 `teamo/gpt-5.6-sol`。如需临时换成其他 Teamo 模型，可在绑定时设置，例如：
+
+```bash
+CODEX_TEAMO_MODEL=teamo/gpt-5.6-terra codex-teamo-bind
+```
+
+`macos/` 目录同时提供与 Windows BAT 对应的 `.command` 双击入口，包括个人网关和 TeamoRouter Desktop。
 
 Desktop bind 首次执行时，如果尚无稳定官方备份，会先保存：
 
@@ -55,7 +63,7 @@ Desktop bind 首次执行时，如果尚无稳定官方备份，会先保存：
 bash macos/test-bind.sh
 ```
 
-测试会在临时 HOME 中放入中文注释、中文 MCP 参数、旧 provider block，然后执行 Gateway → Official 往返切换。它不读取真实密钥，也不会修改真实 `~/.codex`。
+测试会在临时 HOME 中放入中文注释、中文 MCP 参数、旧 provider block，然后执行 Gateway → TeamoRouter → Official 往返切换。它不读取真实密钥，也不会修改真实 `~/.codex`。
 
 ## 在 Mac 上构建 VPS 插件
 
@@ -98,4 +106,4 @@ upstream/cpa-account-config-manager/dist/cpa-account-config-manager.so
 
 ## 当前验证边界
 
-本次适配已经对 shell 语法和 bind 逻辑做了隔离测试，UTF-8 往返测试通过。Keychain provider、真实 Codex Desktop 请求以及 macOS → Linux amd64 的最终 `.so` 仍需要在你的实际 Mac 上做一次端到端验收；在这一步完成前，不替换 VPS 当前生产插件。
+UTF-8 回归、Keychain 取密钥、Personal Gateway CLI、TeamoRouter CLI、Personal Gateway Desktop 与官方恢复已经在实际 Mac 上完成验证。新增 TeamoRouter Desktop 绑定需要再做一次真实 Mac 请求验收；macOS → Linux amd64 的最终 `.so` 交叉构建也仍需验收。在交叉构建验证完成前，不替换 VPS 当前生产插件。
