@@ -78,6 +78,8 @@ install -m 755 "$script_dir/codex-gateway" "$bin_dir/codex-gateway"
 install -m 755 "$script_dir/codex-teamo" "$bin_dir/codex-teamo"
 install -m 755 "$script_dir/codex-gateway-app" "$bin_dir/codex-gateway-app"
 install -m 755 "$script_dir/codex-gateway-bind" "$bin_dir/codex-gateway-bind"
+install -m 755 "$script_dir/codex-teamo-app" "$bin_dir/codex-teamo-app"
+install -m 755 "$script_dir/codex-teamo-bind" "$bin_dir/codex-teamo-bind"
 install -m 755 "$script_dir/codex-official" "$bin_dir/codex-official"
 
 if ! /usr/bin/security find-generic-password -w -a "$keychain_account" -s "$keychain_service" >/dev/null 2>&1; then
@@ -94,6 +96,8 @@ fi
 printf '\nCommands:\n'
 printf '  codex-gateway             Personal Gateway CLI\n'
 printf '  codex-teamo               TeamoRouter CLI\n'
-printf '  codex-gateway-app [path]  Bind gateway and open Codex Desktop\n'
-printf '  codex-gateway-bind        Bind Desktop without opening it\n'
+printf '  codex-gateway-app [path]  Bind Personal Gateway and open Codex Desktop\n'
+printf '  codex-gateway-bind        Bind Desktop to Personal Gateway\n'
+printf '  codex-teamo-app [path]    Bind TeamoRouter and open Codex Desktop\n'
+printf '  codex-teamo-bind          Bind Desktop to TeamoRouter\n'
 printf '  codex-official            Restore official OpenAI provider\n'
