@@ -3,9 +3,9 @@ set -euo pipefail
 
 mode="${1:-}"
 case "$mode" in
-  gateway|official) ;;
+  gateway|teamo|official) ;;
   *)
-    printf 'Usage: %s <gateway|official>\n' "$0" >&2
+    printf 'Usage: %s <gateway|teamo|official>\n' "$0" >&2
     exit 2
     ;;
 esac
@@ -101,7 +101,7 @@ atomic_replace() {
   rm -f "$rollback"
 }
 
-if [[ "$mode" == "gateway" ]]; then
+if [[ "$mode" == "gateway" || "$mode" == "teamo" ]]; then
   if [[ ! -f "$profile_path" ]]; then
     printf 'Gateway profile not found: %s\nRun macos/install.sh first.\n' "$profile_path" >&2
     exit 1
@@ -125,14 +125,21 @@ if [[ "$mode" == "gateway" ]]; then
     exit 1
   fi
 
-  gateway_model="$(read_top_value "$profile_path" model gpt-5.4)"
+  if [[ "$mode" == "teamo" ]]; then
+    selected_model="${CODEX_TEAMO_MODEL:-teamo/gpt-5.6-sol}"
+    label="TeamoRouter"
+  else
+    selected_model="$(read_top_value "$profile_path" model gpt-5.4)"
+    label="Personal Gateway"
+  fi
+
   tmp="$(mktemp "$codex_home/.config.toml.gateway.XXXXXX")"
   trap 'rm -f "$tmp"' EXIT
-  write_top_values "$config_path" "$tmp" "$gateway_model" personal_gateway 1
+  write_top_values "$config_path" "$tmp" "$selected_model" personal_gateway 1
   printf '\n%s\n' "$provider_block" >> "$tmp"
   atomic_replace "$tmp" "$config_path"
   trap - EXIT
-  printf 'Codex Desktop is bound to Personal Gateway. Reopen the app to apply it.\n'
+  printf 'Codex Desktop is bound to %s (%s). Reopen the app to apply it.\n' "$label" "$selected_model"
   exit 0
 fi
 
