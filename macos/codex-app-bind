@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode="${1:-}"
+case "$mode" in
+  gateway|official) ;;
+  *)
+    printf 'Usage: %s <gateway|official>\n' "$0" >&2
+    exit 2
+    ;;
+esac
+
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+config_path="$codex_home/config.toml"
+profile_path="$codex_home/personal-gateway.config.toml"
+backup_path="$codex_home/config.toml.personal-gateway-official.bak"
+
+mkdir -p "$codex_home"
+if [[ ! -f "$config_path" ]]; then
+  : > "$config_path"
+fi
+
+read_top_value() {
+  local path="$1" name="$2" fallback="$3" value
+  value="$(awk -v name="$name" '
+    /^[[:space:]]*\[/ { exit }
+    $0 ~ "^[[:space:]]*" name "[[:space:]]*=" {
+      line=$0
+      sub(/^[^=]*=[[:space:]]*/, "", line)
+      if (line ~ /^"/) {
+        sub(/^"/, "", line)
+        sub(/"[[:space:]]*(#.*)?$/, "", line)
+        print line
+        exit
+      }
+    }
+  ' "$path")"
+  if [[ -n "$value" ]]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+write_top_values() {
+  local input="$1" output="$2" model="$3" provider="$4" strip_gateway_block="$5"
+  awk -v model="$model" -v provider="$provider" -v strip="$strip_gateway_block" '
+    BEGIN {
+      in_top=1
+      saw_model=0
+      saw_provider=0
+      skip_gateway=0
+    }
+    function emit_missing_top() {
+      if (!saw_model) print "model = \"" model "\""
+      if (!saw_provider) print "model_provider = \"" provider "\""
+    }
+    {
+      line=$0
+      if (line ~ /^[[:space:]]*\[/) {
+        if (in_top) {
+          emit_missing_top()
+          in_top=0
+        }
+        if (strip == "1" && line ~ /^[[:space:]]*\[model_providers\.personal_gateway([.][^]]+)?\][[:space:]]*$/) {
+          skip_gateway=1
+          next
+        }
+        if (skip_gateway) {
+          skip_gateway=0
+        }
+      }
+      if (skip_gateway) next
+      if (in_top && line ~ /^[[:space:]]*model[[:space:]]*=/) {
+        print "model = \"" model "\""
+        saw_model=1
+        next
+      }
+      if (in_top && line ~ /^[[:space:]]*model_provider[[:space:]]*=/) {
+        print "model_provider = \"" provider "\""
+        saw_provider=1
+        next
+      }
+      print line
+    }
+    END {
+      if (in_top) emit_missing_top()
+    }
+  ' "$input" > "$output"
+}
+
+atomic_replace() {
+  local source="$1" target="$2" dir base rollback
+  dir="$(dirname "$target")"
+  base="$(basename "$target")"
+  rollback="$dir/$base.rollback-personal-gateway"
+  if [[ -f "$target" ]]; then
+    cp -p "$target" "$rollback"
+  fi
+  mv -f "$source" "$target"
+  rm -f "$rollback"
+}
+
+if [[ "$mode" == "gateway" ]]; then
+  if [[ ! -f "$profile_path" ]]; then
+    printf 'Gateway profile not found: %s\nRun macos/install.sh first.\n' "$profile_path" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "$backup_path" ]]; then
+    current_provider="$(read_top_value "$config_path" model_provider openai)"
+    if [[ "$current_provider" != "openai" ]]; then
+      printf 'Official config backup is missing; refusing to overwrite provider %s.\n' "$current_provider" >&2
+      exit 1
+    fi
+    cp -p "$config_path" "$backup_path"
+  fi
+
+  provider_block="$(awk '
+    /^[[:space:]]*\[model_providers\.personal_gateway\][[:space:]]*$/ { capture=1 }
+    capture { print }
+  ' "$profile_path")"
+  if [[ -z "$provider_block" ]]; then
+    printf 'Gateway provider block is missing from %s\n' "$profile_path" >&2
+    exit 1
+  fi
+
+  gateway_model="$(read_top_value "$profile_path" model gpt-5.4)"
+  tmp="$(mktemp "$codex_home/.config.toml.gateway.XXXXXX")"
+  trap 'rm -f "$tmp"' EXIT
+  write_top_values "$config_path" "$tmp" "$gateway_model" personal_gateway 1
+  printf '\n%s\n' "$provider_block" >> "$tmp"
+  atomic_replace "$tmp" "$config_path"
+  trap - EXIT
+  printf 'Codex Desktop is bound to Personal Gateway. Reopen the app to apply it.\n'
+  exit 0
+fi
+
+if [[ -f "$backup_path" ]]; then
+  official_model="$(read_top_value "$backup_path" model gpt-5.6-sol)"
+  official_provider="$(read_top_value "$backup_path" model_provider openai)"
+else
+  official_model="gpt-5.6-sol"
+  official_provider="openai"
+fi
+
+tmp="$(mktemp "$codex_home/.config.toml.official.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+write_top_values "$config_path" "$tmp" "$official_model" "$official_provider" 0
+atomic_replace "$tmp" "$config_path"
+trap - EXIT
+printf 'Codex Desktop is restored to the official OpenAI provider. Reopen the app to apply it.\n'
